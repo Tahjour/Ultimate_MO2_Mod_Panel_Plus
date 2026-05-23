@@ -1,0 +1,1 @@
+from .mod_description_manager import createPlugin

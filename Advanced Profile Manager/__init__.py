@@ -1,0 +1,1 @@
+from .advanced_profile_manager import createPlugin

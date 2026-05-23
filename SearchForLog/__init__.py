@@ -1,0 +1,2 @@
+from .SearchForLog import createPlugin
+
