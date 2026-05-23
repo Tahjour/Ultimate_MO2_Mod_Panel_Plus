@@ -1,6 +1,5 @@
 import os
 
-import mobase
 from PyQt6.QtCore import Qt, QSettings, pyqtSignal
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
@@ -26,6 +25,7 @@ from PyQt6.QtWidgets import (
 )
 
 from .workers import FileSearchWorker
+from .archive_core import AssetSource, GAME_DATA_OWNER
 
 
 class CollapsibleSplitter(QSplitter):
@@ -117,6 +117,7 @@ class FileSearchTab(QWidget):
     }
 
     file_selected = pyqtSignal(str)
+    include_bsas_changed = pyqtSignal(bool)
 
     def __init__(self, parent, organizer: "mobase.IOrganizer", mods_view: "QTreeView"):
         super().__init__(parent)
@@ -180,8 +181,15 @@ class FileSearchTab(QWidget):
 
         btn_layout.addStretch()
 
+        self.include_bsas_cb = QCheckBox("Include BSAs (all mods + game data)", self)
+        self.include_bsas_cb.setChecked(
+            self.settings.value(f"{self.SETTINGS_KEY}/IncludeBSAs", False, type=bool)
+        )
+        btn_layout.addWidget(self.include_bsas_cb)
+
         self.active_mods_only_cb = QCheckBox("Active Mods Only", self)
         btn_layout.addWidget(self.active_mods_only_cb)
+        self._apply_scope_controls()
 
         search_layout.addLayout(btn_layout)
 
@@ -199,8 +207,9 @@ class FileSearchTab(QWidget):
         results_layout.setContentsMargins(4, 2, 4, 2)
 
         self.results_tree = QTreeWidget(self)
-        self.results_tree.setHeaderLabels(["Mod / File Path", "Full Path"])
+        self.results_tree.setHeaderLabels(["Mod / File Path", "Source", "Container / Full Path"])
         self.results_tree.setColumnWidth(0, 400)
+        self.results_tree.setColumnWidth(1, 120)
         self.results_tree.setAlternatingRowColors(True)
         self.results_tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self._set_rows_height(self.results_tree, 20, fixed=True)
@@ -275,6 +284,28 @@ class FileSearchTab(QWidget):
         self.open_folder_btn.clicked.connect(self._open_selected_folder)
 
         self.recent_list.itemDoubleClicked.connect(self._on_recent_clicked)
+        self.include_bsas_cb.toggled.connect(self._on_include_bsas_toggled)
+
+    def _apply_scope_controls(self):
+        exhaustive = self.include_bsas_cb.isChecked()
+        self.active_mods_only_cb.setEnabled(not exhaustive)
+        self.active_mods_only_cb.setToolTip(
+            "Include BSAs searches all installed mods and game data."
+            if exhaustive
+            else ""
+        )
+
+    def _on_include_bsas_toggled(self, checked: bool):
+        self.settings.setValue(f"{self.SETTINGS_KEY}/IncludeBSAs", checked)
+        self.settings.sync()
+        self._apply_scope_controls()
+        self.include_bsas_changed.emit(checked)
+
+    def set_include_bsas(self, checked: bool):
+        if self.include_bsas_cb.isChecked() != checked:
+            self.include_bsas_cb.setChecked(checked)
+        else:
+            self._apply_scope_controls()
 
     def _load_recent_searches(self):
         self.recent_searches = self.settings.value(f"{self.SETTINGS_KEY}/RecentFileSearches", [], type=list)
@@ -352,11 +383,14 @@ class FileSearchTab(QWidget):
             self._organizer,
             search_text,
             extensions,
+            search_in_bsa=self.include_bsas_cb.isChecked(),
+            only_active=self.active_mods_only_cb.isChecked() and not self.include_bsas_cb.isChecked(),
         )
 
         self._search_worker.progress.connect(self._on_search_progress)
         self._search_worker.result_found.connect(self._on_result_found)
         self._search_worker.finished_search.connect(self._on_search_finished)
+        self._search_worker.warning.connect(self._on_search_warning)
 
         self._search_worker.start()
 
@@ -368,56 +402,49 @@ class FileSearchTab(QWidget):
     def _clear_results(self):
         self.results_tree.clear()
         self._search_results = {}
+        self._result_items = {}
+        self._result_file_count = 0
         self.results_label.setText("No results")
         self.goto_mod_btn.setEnabled(False)
         self.open_folder_btn.setEnabled(False)
 
     def _on_search_progress(self, current: int, total: int):
-        self.progress_bar.setMaximum(total)
-        self.progress_bar.setValue(current)
-        self.file_selected.emit(f"Searching... ({current}/{total} mods)")
+        if total > 0:
+            self.progress_bar.setMaximum(total)
+            self.progress_bar.setValue(current)
+            self.file_selected.emit(f"Searching... ({current}/{total} assets)")
+        else:
+            self.progress_bar.setMaximum(0)
+            self.file_selected.emit(f"Searching... ({current} assets)")
 
-    def _on_result_found(self, mod_name: str, relative_path: str, full_path: str):
-        if self.active_mods_only_cb.isChecked():
-            state = self._mod_list.state(mod_name)
-            if not (state & mobase.ModState.ACTIVE):
-                return
-
-        if mod_name not in self._search_results:
-            self._search_results[mod_name] = []
-
-        self._search_results[mod_name].append((relative_path, full_path))
-        self._update_results_tree()
-
-    def _update_results_tree(self):
-        self.results_tree.clear()
-
-        total_files = 0
-
-        for mod_name, files in sorted(self._search_results.items()):
-            mod_item = QTreeWidgetItem([mod_name, ""])
-
+    def _on_result_found(self, source: AssetSource):
+        if source.owner not in self._search_results:
+            self._search_results[source.owner] = []
+            mod_item = QTreeWidgetItem([source.owner, "", ""])
             font = QFont()
             font.setBold(True)
             mod_item.setFont(0, font)
-            mod_item.setData(0, Qt.ItemDataRole.UserRole, {"type": "mod", "name": mod_name})
-
-            for relative_path, full_path in files:
-                file_item = QTreeWidgetItem([relative_path, full_path])
-                file_item.setData(0, Qt.ItemDataRole.UserRole, {
-                    "type": "file",
-                    "mod_name": mod_name,
-                    "relative_path": relative_path,
-                    "full_path": full_path,
-                })
-
-                mod_item.addChild(file_item)
-                total_files += 1
-
+            mod_item.setData(0, Qt.ItemDataRole.UserRole, {"type": "mod", "name": source.owner})
             self.results_tree.addTopLevelItem(mod_item)
+            self._result_items[source.owner] = mod_item
 
-        mod_count = len(self._search_results)
-        self.results_label.setText(f"{total_files} files in {mod_count} mods")
+        self._search_results[source.owner].append(source)
+        source_label = source.archive_name or "Loose file"
+        file_item = QTreeWidgetItem(
+            [source.virtual_path, source_label, source.location_text]
+        )
+        file_item.setData(0, Qt.ItemDataRole.UserRole, {
+            "type": "file",
+            "source": source,
+        })
+        self._result_items[source.owner].addChild(file_item)
+        self._result_file_count += 1
+        self.results_label.setText(
+            f"{self._result_file_count} files in {len(self._search_results)} sources"
+        )
+
+    def _on_search_warning(self, message: str):
+        self.file_selected.emit(f"Archive warning: {message}")
 
     def _on_search_finished(self, total_results: int):
         self.search_btn.setEnabled(True)
@@ -425,17 +452,22 @@ class FileSearchTab(QWidget):
         self.progress_bar.setVisible(False)
 
         mod_count = len(self._search_results)
-        self.file_selected.emit(f"Search complete: {total_results} files in {mod_count} mods")
+        self.file_selected.emit(f"Search complete: {total_results} files in {mod_count} sources")
 
         if mod_count <= 20:
             self.results_tree.expandAll()
 
     def _on_selection_changed(self):
         items = self.results_tree.selectedItems()
-        has_selection = len(items) > 0
-
-        self.goto_mod_btn.setEnabled(has_selection)
-        self.open_folder_btn.setEnabled(has_selection)
+        if not items:
+            self.goto_mod_btn.setEnabled(False)
+            self.open_folder_btn.setEnabled(False)
+            return
+        data = items[0].data(0, Qt.ItemDataRole.UserRole) or {}
+        source = data.get("source")
+        owner = source.owner if source else data.get("name")
+        self.goto_mod_btn.setEnabled(bool(owner and owner != GAME_DATA_OWNER))
+        self.open_folder_btn.setEnabled(True)
 
     def _on_item_double_clicked(self, item: QTreeWidgetItem, column: int):
         data = item.data(0, Qt.ItemDataRole.UserRole)
@@ -443,9 +475,12 @@ class FileSearchTab(QWidget):
             return
 
         if data["type"] == "mod":
-            self._goto_mod(data["name"])
+            if data["name"] != GAME_DATA_OWNER:
+                self._goto_mod(data["name"])
         else:
-            self._goto_mod(data["mod_name"])
+            source = data["source"]
+            if not source.is_game:
+                self._goto_mod(source.owner)
 
     def _goto_selected_mod(self):
         items = self.results_tree.selectedItems()
@@ -456,8 +491,9 @@ class FileSearchTab(QWidget):
         if not data:
             return
 
-        mod_name = data.get("name") or data.get("mod_name")
-        if mod_name:
+        source = data.get("source")
+        mod_name = data.get("name") or (source.owner if source else None)
+        if mod_name and mod_name != GAME_DATA_OWNER:
             self._goto_mod(mod_name)
 
     def _goto_mod(self, mod_name: str):
@@ -510,8 +546,13 @@ class FileSearchTab(QWidget):
             return
 
         if data["type"] == "file":
-            folder_path = os.path.dirname(data["full_path"])
+            source = data["source"]
+            target_path = source.navigation_path
+            folder_path = os.path.dirname(target_path)
         else:
+            target_path = ""
+            if data["name"] == GAME_DATA_OWNER:
+                return
             mod_info = self._organizer.getMod(data["name"])
             if mod_info:
                 folder_path = mod_info.absolutePath()
@@ -523,7 +564,10 @@ class FileSearchTab(QWidget):
             import sys
 
             if sys.platform == "win32":
-                os.startfile(folder_path)
+                if target_path and os.path.exists(target_path):
+                    subprocess.run(["explorer", "/select,", target_path])
+                else:
+                    os.startfile(folder_path)
             elif sys.platform == "darwin":
                 subprocess.Popen(["open", folder_path])
             else:
@@ -542,7 +586,9 @@ class FileSearchTab(QWidget):
         self.search_input.selectAll()
 
     def refresh_if_needed(self):
-        pass
+        self.set_include_bsas(
+            self.settings.value(f"{self.SETTINGS_KEY}/IncludeBSAs", False, type=bool)
+        )
 
     def handle_key_press(self, key: int) -> bool:
         if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):

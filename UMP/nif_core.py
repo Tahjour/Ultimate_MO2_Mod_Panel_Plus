@@ -6,8 +6,9 @@ from pathlib import Path
 from typing import Optional
 from dataclasses import dataclass, field
 
-import mobase
 from PyQt6.QtCore import QThread, pyqtSignal
+
+from .archive_core import AssetCatalog, AssetSource, build_index_scope
 
 
 @dataclass
@@ -16,10 +17,16 @@ class NifTextureEntry:
     relative_path: str
     textures: list[str] = field(default_factory=list)
     file_mtime: float = 0.0
+    source_kind: str = "loose"
+    container_path: str = ""
+    is_game: bool = False
 
     @property
     def key(self) -> str:
-        return f"{self.mod_name}|{self.relative_path}"
+        return (
+            f"{self.source_kind}|{self.mod_name}|"
+            f"{self.container_path.lower()}|{self.relative_path.lower()}"
+        )
 
     @property
     def filename(self) -> str:
@@ -32,7 +39,7 @@ class LightweightNifParser:
     VER_10_1_0_0 = 0x0A010000
     VER_20_0_0_4 = 0x14000004
 
-    def __init__(self, filepath: Path):
+    def __init__(self, filepath: Optional[Path] = None):
         self.filepath = filepath
         self.textures: list[str] = []
         self.version: int = 0
@@ -40,12 +47,17 @@ class LightweightNifParser:
         self.user_version_2: int = 0
 
     def parse(self) -> list[str]:
+        if self.filepath is None:
+            return []
         try:
             with open(self.filepath, "rb") as f:
                 data = f.read()
         except IOError:
             return []
 
+        return self.parse_bytes(data)
+
+    def parse_bytes(self, data: bytes) -> list[str]:
         self.textures = []
 
         try:
@@ -174,7 +186,7 @@ class LightweightNifParser:
 
 
 class NifTextureIndex:
-    CACHE_VERSION = 2
+    CACHE_VERSION = 3
     PATH_CLEANUP_RE = re.compile(r"^(?:\.?/?(?:data|textures|meshes)/?)+", re.IGNORECASE)
     MULTI_SLASH_RE = re.compile(r"/+")
 
@@ -190,6 +202,7 @@ class NifTextureIndex:
 
         self._is_loaded = False
         self._is_dirty = False
+        self._scope: dict = {}
 
     @property
     def is_loaded(self) -> bool:
@@ -223,7 +236,10 @@ class NifTextureIndex:
     def remove_extension(path: str) -> str:
         return path[:-4] if path.lower().endswith(".dds") else path
 
-    def load_from_cache(self) -> bool:
+    def set_scope(self, scope: dict) -> None:
+        self._scope = scope
+
+    def load_from_cache(self, expected_scope: Optional[dict] = None) -> bool:
         if not self._cache_file.exists():
             return False
 
@@ -233,15 +249,22 @@ class NifTextureIndex:
 
             if data.get("version") != self.CACHE_VERSION:
                 return False
+            if expected_scope is not None and data.get("scope", {}) != expected_scope:
+                return False
 
             entries = data.get("entries", [])
 
+            self.clear()
+            self._scope = data.get("scope", {})
             for entry_data in entries:
                 entry = NifTextureEntry(
                     mod_name=entry_data["mod"],
                     relative_path=entry_data["path"],
                     textures=entry_data["textures"],
                     file_mtime=entry_data.get("mtime", 0),
+                    source_kind=entry_data.get("source_kind", "loose"),
+                    container_path=entry_data.get("container_path", ""),
+                    is_game=entry_data.get("is_game", False),
                 )
                 self._add_entry(entry)
 
@@ -267,10 +290,17 @@ class NifTextureIndex:
                         "path": entry.relative_path,
                         "textures": entry.textures,
                         "mtime": entry.file_mtime,
+                        "source_kind": entry.source_kind,
+                        "container_path": entry.container_path,
+                        "is_game": entry.is_game,
                     }
                 )
 
-            data = {"version": self.CACHE_VERSION, "entries": entries}
+            data = {
+                "version": self.CACHE_VERSION,
+                "scope": self._scope,
+                "entries": entries,
+            }
 
             with open(self._cache_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False)
@@ -283,6 +313,9 @@ class NifTextureIndex:
 
     def _add_entry(self, entry: NifTextureEntry) -> None:
         key = entry.key
+        previous = self._nif_entries.get(key)
+        if previous is not None:
+            self._remove_entry_links(key, previous)
         self._nif_entries[key] = entry
 
         for tex in entry.textures:
@@ -301,26 +334,71 @@ class NifTextureIndex:
                         self._texture_filename_cache[fn] = set()
                     self._texture_filename_cache[fn].add(normalized)
 
+    def _remove_entry_links(self, key: str, entry: NifTextureEntry) -> None:
+        removed_paths: set[str] = set()
+        for tex in entry.textures:
+            normalized = self.normalize_path(tex)
+            keys = self._texture_to_nifs.get(normalized)
+            if keys is None:
+                continue
+            keys.discard(key)
+            if not keys:
+                self._texture_to_nifs.pop(normalized, None)
+                removed_paths.add(normalized)
+        if removed_paths:
+            for filename, paths in list(self._texture_filename_cache.items()):
+                paths.difference_update(removed_paths)
+                if not paths:
+                    self._texture_filename_cache.pop(filename, None)
+
     def add_nif(
         self,
         mod_name: str,
         relative_path: str,
         textures: list[str],
         mtime: float = 0,
+        source_kind: str = "loose",
+        container_path: str = "",
+        is_game: bool = False,
     ) -> None:
         entry = NifTextureEntry(
             mod_name=mod_name,
             relative_path=relative_path,
             textures=textures,
             file_mtime=mtime,
+            source_kind=source_kind,
+            container_path=container_path,
+            is_game=is_game,
         )
         self._add_entry(entry)
         self._is_dirty = True
         self._is_loaded = True
 
-    def get_entry(self, mod_name: str, relative_path: str) -> Optional[NifTextureEntry]:
-        key = f"{mod_name}|{relative_path}"
+    def add_entry(self, entry: NifTextureEntry) -> None:
+        self._add_entry(entry)
+        self._is_dirty = True
+        self._is_loaded = True
+
+    def get_entry(
+        self,
+        mod_name: str,
+        relative_path: str,
+        source_kind: str = "loose",
+        container_path: str = "",
+    ) -> Optional[NifTextureEntry]:
+        key = (
+            f"{source_kind}|{mod_name}|"
+            f"{container_path.lower()}|{relative_path.lower()}"
+        )
         return self._nif_entries.get(key)
+
+    def get_source_entry(self, source: AssetSource) -> Optional[NifTextureEntry]:
+        return self.get_entry(
+            source.owner,
+            source.virtual_path,
+            source.source_kind,
+            source.container_path,
+        )
 
     def find_nifs_by_texture(
         self,
@@ -430,15 +508,12 @@ class NifTextureIndex:
         self._is_dirty = False
 
     def invalidate_mod(self, mod_name: str) -> None:
-        keys_to_remove = [k for k in self._nif_entries if k.startswith(f"{mod_name}|")]
+        keys_to_remove = [k for k, entry in self._nif_entries.items() if entry.mod_name == mod_name]
 
         for key in keys_to_remove:
             entry = self._nif_entries.pop(key, None)
             if entry:
-                for tex in entry.textures:
-                    normalized = self.normalize_path(tex)
-                    if normalized in self._texture_to_nifs:
-                        self._texture_to_nifs[normalized].discard(key)
+                self._remove_entry_links(key, entry)
 
         self._is_dirty = True
 
@@ -446,9 +521,10 @@ class NifTextureIndex:
 class NifIndexWorker(QThread):
     started = pyqtSignal()
     progress = pyqtSignal(int, int, str)
-    entry_ready = pyqtSignal(str, str, list, float)
+    entry_ready = pyqtSignal(object)
     finished = pyqtSignal(int, int)
     error = pyqtSignal(str)
+    warning = pyqtSignal(str)
 
     def __init__(
         self,
@@ -456,12 +532,14 @@ class NifIndexWorker(QThread):
         index: NifTextureIndex,
         only_active: bool = True,
         incremental: bool = True,
+        include_archives: bool = False,
     ):
         super().__init__()
         self._organizer = organizer
         self._index = index
         self._only_active = only_active
         self._incremental = incremental
+        self._include_archives = include_archives
         self._cancelled = False
 
     def cancel(self) -> None:
@@ -471,33 +549,31 @@ class NifIndexWorker(QThread):
         self.started.emit()
         self._cancelled = False
 
-        mod_list = self._organizer.modList()
-        mods_path = Path(self._organizer.modsPath())
-
-        nif_files: list[tuple[str, Path]] = []
-
-        for mod_name in mod_list.allMods():
-            if self._cancelled:
-                break
-
-            state = mod_list.state(mod_name)
-
-            if self._only_active and not (state & mobase.ModState.ACTIVE):
-                continue
-
-            if not (state & mobase.ModState.EXISTS):
-                continue
-
-            mod_path = mods_path / mod_name
-
-            if not mod_path.exists():
-                continue
-
-            try:
-                for nif_path in mod_path.rglob("*.nif"):
-                    nif_files.append((mod_name, nif_path))
-            except Exception:
-                continue
+        try:
+            scope = build_index_scope(
+                self._organizer,
+                self._include_archives,
+                self._only_active,
+            )
+            self._index.set_scope(scope)
+            catalog = AssetCatalog(
+                self._organizer,
+                include_archives=self._include_archives,
+                exhaustive=self._include_archives,
+                active_only=self._only_active,
+            )
+            nif_files = list(
+                catalog.iter_sources(
+                    [".nif"],
+                    include_archive_members=self._include_archives,
+                    cancelled=lambda: self._cancelled,
+                )
+            )
+            for message in catalog.errors:
+                self.warning.emit(message)
+        except Exception as exc:
+            self.error.emit(str(exc))
+            return
 
         if self._cancelled:
             self.finished.emit(0, 0)
@@ -506,34 +582,47 @@ class NifIndexWorker(QThread):
         total = len(nif_files)
         processed = 0
         new_textures = 0
+        reported_archive_errors: set[tuple[str, str]] = set()
 
-        for mod_name, nif_path in nif_files:
+        for source in nif_files:
             if self._cancelled:
                 break
 
             processed += 1
-            self.progress.emit(processed, total, nif_path.name)
+            self.progress.emit(processed, total, source.filename)
 
             try:
-                mod_path = mods_path / mod_name
-                relative = str(nif_path.relative_to(mod_path))
-                mtime = nif_path.stat().st_mtime
-
                 if self._incremental:
-                    existing = self._index.get_entry(mod_name, relative)
-                    if existing and existing.file_mtime >= mtime:
+                    existing = self._index.get_source_entry(source)
+                    if existing and existing.file_mtime >= source.mtime:
                         continue
 
-                parser = LightweightNifParser(nif_path)
-                textures = parser.parse()
+                parser = LightweightNifParser()
+                textures = parser.parse_bytes(catalog.read_bytes(source))
 
                 if textures:
                     new_textures += len(textures)
-                    self.entry_ready.emit(mod_name, relative, textures, mtime)
+                    self.entry_ready.emit(
+                        NifTextureEntry(
+                            mod_name=source.owner,
+                            relative_path=source.virtual_path,
+                            textures=textures,
+                            file_mtime=source.mtime,
+                            source_kind=source.source_kind,
+                            container_path=source.container_path,
+                            is_game=source.is_game,
+                        )
+                    )
 
-            except Exception:
+            except Exception as exc:
+                if source.source_kind == "bsa":
+                    key = (source.container_path, str(exc))
+                    if key not in reported_archive_errors:
+                        reported_archive_errors.add(key)
+                        self.warning.emit(f"{source.archive_name}: {exc}")
                 continue
 
+        catalog.close()
         self.finished.emit(processed, new_textures)
 
 
@@ -543,4 +632,3 @@ __all__ = [
     "NifTextureIndex",
     "NifIndexWorker",
 ]
-

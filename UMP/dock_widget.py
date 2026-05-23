@@ -157,6 +157,13 @@ class AdvancedSearchDock(QDockWidget):
             self.esp_field_search_tab.search_status.connect(self._update_status)
         if self.nif_texture_tab:
             self.nif_texture_tab.status_changed.connect(self._update_status)
+        if self.file_search_tab and self.nif_texture_tab:
+            self.file_search_tab.include_bsas_changed.connect(
+                self.nif_texture_tab.set_include_bsas
+            )
+            self.nif_texture_tab.include_bsas_changed.connect(
+                self.file_search_tab.set_include_bsas
+            )
 
         self.tab_widget.currentChanged.connect(self._on_tab_changed)
 

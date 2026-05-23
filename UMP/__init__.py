@@ -1,12 +1,8 @@
-"""Advanced Search (Full Mod Search) plugin package for Mod Organizer 2.
+"""Ultimate Mods Panel plugin package for Mod Organizer 2.
 
-Этот пакет предоставляет точку входа createPlugin() по образцу других
-модульных плагинов MO2 (например, ContentFilter, NIF Analyzer и т.п.).
-
-Основная реализация плагина находится в модуле amsp_pro.py внутри этой
-же папки AdvancedSearch. Здесь мы только проксируем создание экземпляра,
-чтобы плагин можно было считать "модульным" и размещённым в собственной
-папке.
+The supported panel implementation is assembled from plugin.py and its
+modular tab implementations. Additional bundled tool plugins are registered
+below when they are available.
 """
 
 from __future__ import annotations
@@ -20,14 +16,6 @@ try:
     from .plugin import FullModSearchPlugin
 except ImportError:
     FullModSearchPlugin = None  # type: ignore[assignment]
-
-try:
-    from .amsp_pro import FullModSearchPlugin as AdvancedSearchProPlugin
-except ImportError as e:  # pragma: no cover - защитный путь
-    AdvancedSearchProPlugin = None  # type: ignore[assignment]
-    _import_error: Optional[Exception] = e
-else:
-    _import_error = None
 
 _hmm_module = None
 _hmm_import_error: Optional[Exception] = None
@@ -173,9 +161,6 @@ def createPlugins():
 
     if FullModSearchPlugin is not None:
         plugins.append(FullModSearchPlugin())
-
-    if "AdvancedSearchProPlugin" in globals() and AdvancedSearchProPlugin is not None:
-        plugins.append(AdvancedSearchProPlugin())
 
     try:
         if _hmm_module is not None and hasattr(_hmm_module, "createPlugin"):

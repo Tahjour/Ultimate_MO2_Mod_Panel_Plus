@@ -1,7 +1,6 @@
 import os
 from pathlib import Path
 
-import mobase
 from PyQt6.QtCore import Qt, QSettings, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
@@ -26,6 +25,7 @@ from PyQt6.QtWidgets import (
 )
 
 from .nif_core import NifTextureEntry, NifTextureIndex, NifIndexWorker
+from .archive_core import AssetCatalog, build_index_scope
 
 
 class NifTextureSearchTab(QWidget):
@@ -38,6 +38,7 @@ class NifTextureSearchTab(QWidget):
 
     status_changed = pyqtSignal(str)
     goto_mod = pyqtSignal(str)
+    include_bsas_changed = pyqtSignal(bool)
 
     def __init__(self, parent, organizer: "mobase.IOrganizer", mods_view: "QTreeView"):
         super().__init__(parent)
@@ -51,6 +52,8 @@ class NifTextureSearchTab(QWidget):
         self._index_worker: NifIndexWorker = None
         self._first_activation = True
         self._is_indexing = False
+        self._pending_scope_rebuild = False
+        self._asset_catalog: AssetCatalog = None
 
         self.settings = QSettings("ModOrganizer2", "FullModSearchPlugin")
 
@@ -196,6 +199,13 @@ class NifTextureSearchTab(QWidget):
         self._active_only_cb.setChecked(True)
         bottom_row.addWidget(self._active_only_cb)
 
+        self._include_bsas_cb = QCheckBox("Include BSAs (all mods + game data)")
+        self._include_bsas_cb.setChecked(
+            self.settings.value(f"{self.SETTINGS_KEY}/IncludeBSAs", False, type=bool)
+        )
+        bottom_row.addWidget(self._include_bsas_cb)
+        self._apply_scope_controls()
+
         bottom_row.addStretch()
 
         self._goto_btn = QPushButton("➡️ Go to Mod")
@@ -234,16 +244,69 @@ class NifTextureSearchTab(QWidget):
         self._open_folder_btn.clicked.connect(self._open_selected_folder)
 
         self._nif_to_dds_radio.toggled.connect(self._on_mode_changed)
+        self._include_bsas_cb.toggled.connect(self._on_include_bsas_toggled)
+        self._active_only_cb.toggled.connect(self._on_active_only_toggled)
+
+    def _apply_scope_controls(self) -> None:
+        exhaustive = self._include_bsas_cb.isChecked()
+        self._active_only_cb.setEnabled(not exhaustive)
+        self._active_only_cb.setToolTip(
+            "Include BSAs indexes all installed mods and game data."
+            if exhaustive
+            else ""
+        )
+
+    def _current_scope(self) -> dict:
+        include_bsas = self._include_bsas_cb.isChecked()
+        only_active = self._active_only_cb.isChecked() and not include_bsas
+        return build_index_scope(self._organizer, include_bsas, only_active)
+
+    def _on_include_bsas_toggled(self, checked: bool) -> None:
+        self.settings.setValue(f"{self.SETTINGS_KEY}/IncludeBSAs", checked)
+        self.settings.sync()
+        self._apply_scope_controls()
+        self._asset_catalog = None
+        self.include_bsas_changed.emit(checked)
+        self._index.clear()
+        self._update_index_status()
+        if self._is_indexing:
+            self._pending_scope_rebuild = True
+            self._stop_indexing()
+        elif not self._first_activation:
+            QTimer.singleShot(0, lambda: self._start_indexing(force_rebuild=True))
+
+    def _on_active_only_toggled(self, _checked: bool) -> None:
+        if self._include_bsas_cb.isChecked():
+            return
+        self._asset_catalog = None
+        self._index.clear()
+        self._update_index_status()
+        if self._is_indexing:
+            self._pending_scope_rebuild = True
+            self._stop_indexing()
+        elif not self._first_activation:
+            QTimer.singleShot(0, lambda: self._start_indexing(force_rebuild=True))
+
+    def set_include_bsas(self, checked: bool) -> None:
+        if self._include_bsas_cb.isChecked() != checked:
+            self._include_bsas_cb.setChecked(checked)
+        else:
+            self._apply_scope_controls()
 
     def refresh_if_needed(self) -> None:
+        self.set_include_bsas(
+            self.settings.value(f"{self.SETTINGS_KEY}/IncludeBSAs", False, type=bool)
+        )
         if self._first_activation:
             self._first_activation = False
 
-            if self._index.load_from_cache():
+            scope = self._current_scope()
+            self._index.set_scope(scope)
+            if self._index.load_from_cache(scope):
                 self._update_index_status()
                 self.status_changed.emit(f"Index loaded: {self._index.nif_count} NIFs")
             else:
-                QTimer.singleShot(100, self._start_indexing)
+                QTimer.singleShot(100, lambda: self._start_indexing(force_rebuild=True))
 
     def _start_indexing(self, force_rebuild: bool = False) -> None:
         if self._is_indexing:
@@ -251,6 +314,7 @@ class NifTextureSearchTab(QWidget):
 
         if force_rebuild:
             self._index.clear()
+        self._index.set_scope(self._current_scope())
 
         self._is_indexing = True
         self._rebuild_btn.setEnabled(False)
@@ -263,19 +327,22 @@ class NifTextureSearchTab(QWidget):
         self._index_icon.setText("🔄")
         self._index_status.setText("Indexing NIF files...")
 
-        only_active = self._active_only_cb.isChecked()
+        include_bsas = self._include_bsas_cb.isChecked()
+        only_active = self._active_only_cb.isChecked() and not include_bsas
 
         self._index_worker = NifIndexWorker(
             self._organizer,
             self._index,
             only_active=only_active,
             incremental=not force_rebuild,
+            include_archives=include_bsas,
         )
 
         self._index_worker.progress.connect(self._on_index_progress)
         self._index_worker.entry_ready.connect(self._on_entry_ready)
         self._index_worker.finished.connect(self._on_index_finished)
         self._index_worker.error.connect(self._on_index_error)
+        self._index_worker.warning.connect(self._on_index_warning)
 
         self._index_worker.start()
 
@@ -293,9 +360,8 @@ class NifTextureSearchTab(QWidget):
         self._progress_bar.setValue(current)
         self._progress_label.setText(f"{current}/{total}: {filename}")
 
-    def _on_entry_ready(self, mod_name: str, relative_path: str,
-                        textures: list, mtime: float) -> None:
-        self._index.add_nif(mod_name, relative_path, textures, mtime)
+    def _on_entry_ready(self, entry: NifTextureEntry) -> None:
+        self._index.add_entry(entry)
 
     def _on_index_finished(self, total_nifs: int, total_textures: int) -> None:
         self._is_indexing = False
@@ -312,6 +378,12 @@ class NifTextureSearchTab(QWidget):
             f"Indexing complete: {self._index.nif_count} NIFs, "
             f"{self._index.texture_count} textures",
         )
+        if self._pending_scope_rebuild:
+            self._pending_scope_rebuild = False
+            QTimer.singleShot(0, lambda: self._start_indexing(force_rebuild=True))
+
+    def _on_index_warning(self, message: str) -> None:
+        self.status_changed.emit(f"Archive warning: {message}")
 
     def _on_index_error(self, message: str) -> None:
         self._is_indexing = False
@@ -379,16 +451,19 @@ class NifTextureSearchTab(QWidget):
         total_textures = 0
 
         for entry, score in results:
+            source_label = entry.mod_name
+            if entry.source_kind == "bsa":
+                source_label = f"{entry.mod_name} [{Path(entry.container_path).name}]"
             nif_item = QTreeWidgetItem([
                 f"📄 {entry.filename}",
                 str(score),
-                entry.mod_name,
+                source_label,
             ])
             nif_item.setData(0, Qt.ItemDataRole.UserRole, {
                 "type": "nif",
                 "entry": entry,
             })
-            nif_item.setToolTip(0, f"{entry.mod_name}/{entry.relative_path}")
+            nif_item.setToolTip(0, self._entry_location(entry))
 
             font = QFont()
             font.setBold(True)
@@ -439,16 +514,19 @@ class NifTextureSearchTab(QWidget):
             group.setFont(0, font)
 
             for entry, score in items:
+                source_label = entry.mod_name
+                if entry.source_kind == "bsa":
+                    source_label = f"{entry.mod_name} [{Path(entry.container_path).name}]"
                 item = QTreeWidgetItem([
                     entry.filename,
                     str(score),
-                    entry.mod_name,
+                    source_label,
                 ])
                 item.setData(0, Qt.ItemDataRole.UserRole, {
                     "type": "nif",
                     "entry": entry,
                 })
-                item.setToolTip(0, f"{entry.mod_name}/{entry.relative_path}")
+                item.setToolTip(0, self._entry_location(entry))
 
                 group.addChild(item)
 
@@ -470,6 +548,27 @@ class NifTextureSearchTab(QWidget):
             normalized = f"textures/{normalized}"
         if not normalized.endswith(".dds"):
             normalized += ".dds"
+
+        if self._include_bsas_cb.isChecked():
+            if self._asset_catalog is None:
+                self._asset_catalog = AssetCatalog(
+                    self._organizer,
+                    include_archives=True,
+                    exhaustive=True,
+                )
+            matches = self._asset_catalog.find_virtual_path(normalized)
+            if matches:
+                self._add_detail("Status", f"Found ({len(matches)} providers)")
+                for number, source in enumerate(matches, start=1):
+                    self._add_detail(
+                        f"Source {number}",
+                        f"{source.owner}: {source.location_text}",
+                    )
+            else:
+                self._add_detail("Status", "NOT FOUND")
+                self._add_detail("Query", texture_path)
+                self._add_detail("Note", "Not present in loose files or BSAs")
+            return
 
         resolved = self._organizer.resolvePath(normalized)
 
@@ -504,11 +603,11 @@ class NifTextureSearchTab(QWidget):
 
         if item_type == "nif":
             self._show_nif_details(data["entry"])
-            self._goto_btn.setEnabled(True)
+            self._goto_btn.setEnabled(not data["entry"].is_game)
             self._open_folder_btn.setEnabled(True)
         elif item_type == "texture":
             self._show_texture_details(data)
-            self._goto_btn.setEnabled(True)
+            self._goto_btn.setEnabled(not data["nif_entry"].is_game)
             self._open_folder_btn.setEnabled(True)
         else:
             self._goto_btn.setEnabled(False)
@@ -519,6 +618,9 @@ class NifTextureSearchTab(QWidget):
         self._add_detail("File", entry.filename)
         self._add_detail("Path", entry.relative_path)
         self._add_detail("Mod", entry.mod_name)
+        self._add_detail("Source", "BSA" if entry.source_kind == "bsa" else "Loose file")
+        if entry.source_kind == "bsa":
+            self._add_detail("Archive", entry.container_path)
         self._add_detail("Textures", str(len(entry.textures)))
 
     def _show_texture_details(self, data: dict) -> None:
@@ -528,6 +630,13 @@ class NifTextureSearchTab(QWidget):
         if entry:
             self._add_detail("NIF", entry.relative_path)
             self._add_detail("Mod", entry.mod_name)
+            self._add_detail("Source", "BSA" if entry.source_kind == "bsa" else "Loose file")
+
+    @staticmethod
+    def _entry_location(entry: NifTextureEntry) -> str:
+        if entry.source_kind == "bsa":
+            return f"{entry.container_path} :: {entry.relative_path}"
+        return entry.container_path or f"{entry.mod_name}/{entry.relative_path}"
 
     def _copy_detail_item(self, item: QTreeWidgetItem, column: int) -> None:
         value = item.text(1)
@@ -546,7 +655,7 @@ class NifTextureSearchTab(QWidget):
         elif data.get("type") == "texture":
             entry = data.get("nif_entry")
 
-        if entry:
+        if entry and not entry.is_game:
             self._goto_mod_in_view(entry.mod_name)
 
     def _goto_mod_in_view(self, mod_name: str) -> None:
@@ -608,12 +717,14 @@ class NifTextureSearchTab(QWidget):
         if not entry:
             return
 
-        mod_info = self._organizer.getMod(entry.mod_name)
-        if not mod_info:
-            return
-
-        mod_path = mod_info.absolutePath()
-        file_path = os.path.join(mod_path, entry.relative_path)
+        file_path = entry.container_path
+        if not file_path:
+            if entry.is_game:
+                return
+            mod_info = self._organizer.getMod(entry.mod_name)
+            if not mod_info:
+                return
+            file_path = os.path.join(mod_info.absolutePath(), entry.relative_path)
         folder_path = os.path.dirname(file_path)
 
         if os.path.exists(folder_path):
@@ -672,7 +783,7 @@ class NifTextureSearchTab(QWidget):
         elif data.get("type") == "texture":
             entry = data.get("nif_entry")
 
-        if entry:
+        if entry and not entry.is_game:
             self._goto_mod_in_view(entry.mod_name)
 
     def focus_search(self) -> None:
