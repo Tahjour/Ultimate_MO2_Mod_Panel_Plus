@@ -388,7 +388,7 @@ class FileSearchTab(QWidget):
         )
 
         self._search_worker.progress.connect(self._on_search_progress)
-        self._search_worker.result_found.connect(self._on_result_found)
+        self._search_worker.results_batch.connect(self._on_results_batch)
         self._search_worker.finished_search.connect(self._on_search_finished)
         self._search_worker.warning.connect(self._on_search_warning)
 
@@ -416,6 +416,14 @@ class FileSearchTab(QWidget):
         else:
             self.progress_bar.setMaximum(0)
             self.file_selected.emit(f"Searching... ({current} assets)")
+
+    def _on_results_batch(self, sources: list[AssetSource]):
+        self.results_tree.setUpdatesEnabled(False)
+        try:
+            for source in sources:
+                self._on_result_found(source)
+        finally:
+            self.results_tree.setUpdatesEnabled(True)
 
     def _on_result_found(self, source: AssetSource):
         if source.owner not in self._search_results:
@@ -553,7 +561,7 @@ class FileSearchTab(QWidget):
             target_path = ""
             if data["name"] == GAME_DATA_OWNER:
                 return
-            mod_info = self._organizer.getMod(data["name"])
+            mod_info = self._mod_list.getMod(data["name"])
             if mod_info:
                 folder_path = mod_info.absolutePath()
             else:

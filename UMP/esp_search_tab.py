@@ -845,7 +845,7 @@ class EspFieldSearchWorker(QThread):
             if self._active_only and not (state & mobase.ModState.ACTIVE):
                 continue
 
-            mod_info = self._organizer.getMod(mod_name)
+            mod_info = mod_list.getMod(mod_name)
             if not mod_info:
                 continue
             mod_path = mod_info.absolutePath()

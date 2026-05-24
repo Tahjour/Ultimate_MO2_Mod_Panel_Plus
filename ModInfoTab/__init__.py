@@ -86,7 +86,7 @@ def _human_size(nbytes: int) -> str:
 
 def _mod_directory(organizer: mobase.IOrganizer, mod_name: str) -> Optional[str]:
     try:
-        mod_obj = organizer.getMod(mod_name)
+        mod_obj = organizer.modList().getMod(mod_name)
         if mod_obj is not None:
             path = mod_obj.absolutePath()
             if path and os.path.isdir(path):

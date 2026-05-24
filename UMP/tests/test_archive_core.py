@@ -126,6 +126,9 @@ class ArchiveCoreTests(unittest.TestCase):
             def state(self, _name):
                 return 0
 
+            def getMod(self, _name):
+                return FakeMod()
+
         class FakeDirectory:
             def absolutePath(self):
                 return str(game_data)
@@ -137,9 +140,6 @@ class ArchiveCoreTests(unittest.TestCase):
         class FakeOrganizer:
             def modList(self):
                 return FakeModList()
-
-            def getMod(self, _name):
-                return FakeMod()
 
             def modsPath(self):
                 return str(self.root / "mods")

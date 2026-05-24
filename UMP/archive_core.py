@@ -407,7 +407,7 @@ def _iter_mod_roots(organizer, active_only: bool) -> list[tuple[str, Path]]:
         try:
             if not _state_matches(mod_list.state(mod_name), active_only):
                 continue
-            mod = organizer.getMod(mod_name)
+            mod = mod_list.getMod(mod_name)
             root = Path(mod.absolutePath()) if mod else Path(organizer.modsPath()) / mod_name
             if root.exists():
                 roots.append((mod_name, root))

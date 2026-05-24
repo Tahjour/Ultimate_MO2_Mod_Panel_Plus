@@ -57,7 +57,7 @@ class FileSearchWorker(QThread):
             if not (state & mobase.ModState.EXISTS):
                 continue
 
-            mod_info = self._organizer.getMod(mod_name)
+            mod_info = self._organizer.modList().getMod(mod_name)
             if not mod_info:
                 continue
 
@@ -710,7 +710,7 @@ class NifTextureSearchTab(QWidget):
         if not entry:
             return
 
-        mod_info = self._organizer.getMod(entry.mod_name)
+        mod_info = self._organizer.modList().getMod(entry.mod_name)
         if not mod_info:
             return
 
@@ -1801,7 +1801,7 @@ class FileSearchTab(QWidget):
         if data["type"] == "file":
             folder_path = os.path.dirname(data["full_path"])
         else:
-            mod_info = self._organizer.getMod(data["name"])
+            mod_info = self._organizer.modList().getMod(data["name"])
             if mod_info:
                 folder_path = mod_info.absolutePath()
             else:

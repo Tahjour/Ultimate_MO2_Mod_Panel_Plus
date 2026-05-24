@@ -136,10 +136,10 @@ class AutoScrollHighlightPlugin(mobase.IPlugin):
         # Сбрасываем кэш при изменении списка модов/плагинов
         if self._organizer:
             self._organizer.modList().onModStateChanged(
-                lambda *_: self._invalidate_cache()
+                self._on_mod_state_changed
             )
             self._organizer.pluginList().onPluginStateChanged(
-                lambda *_: self._invalidate_cache()
+                self._on_plugin_state_changed
             )
 
         # Горячая клавиша
@@ -149,6 +149,12 @@ class AutoScrollHighlightPlugin(mobase.IPlugin):
             self._refs.append(sc)
 
         _log("Setup complete. F10 to toggle.")
+
+    def _on_mod_state_changed(self, _changes: dict) -> None:
+        self._invalidate_cache()
+
+    def _on_plugin_state_changed(self, _changes: dict) -> None:
+        self._invalidate_cache()
 
     def _refresh_views(self) -> None:
         mods_view = None

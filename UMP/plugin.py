@@ -33,7 +33,7 @@ class FullModSearchPlugin(mobase.IPlugin):
             "UMP: unified search plugin for MO2 with tabs for mods, plugins, files, "
             "and NIF↔DDS texture search. Features: recent history, separator "
             "formatting, file content search, NIF texture indexing with caching. "
-            "Hotkey: F3"
+            "Hotkey: F1"
         )
 
     def version(self) -> mobase.VersionInfo:
@@ -124,15 +124,15 @@ class FullModSearchPlugin(mobase.IPlugin):
             return
         if self._toggle_shortcut is not None:
             try:
-                self._toggle_shortcut.activated.disconnect(self._toggle_dock)
+                self._toggle_shortcut.activated.disconnect()
             except Exception:
                 pass
         self._toggle_shortcut = QShortcut(
-            QKeySequence(Qt.Key.Key_Tab),
+            QKeySequence(Qt.Key.Key_F1),
             self._main_window,
         )
         self._toggle_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
-        self._toggle_shortcut.activated.connect(self._toggle_dock)
+        self._toggle_shortcut.activated.connect(self._show_search)
 
     def _save_main_window_state(self) -> None:
         if not isinstance(self._main_window, QMainWindow):

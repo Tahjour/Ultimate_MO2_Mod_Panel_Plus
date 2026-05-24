@@ -25,7 +25,7 @@ from PyQt6.QtWidgets import (
 )
 
 from .nif_core import NifTextureEntry, NifTextureIndex, NifIndexWorker
-from .archive_core import AssetCatalog, build_index_scope
+from .archive_core import AssetSource
 
 
 class NifTextureSearchTab(QWidget):
@@ -53,7 +53,6 @@ class NifTextureSearchTab(QWidget):
         self._first_activation = True
         self._is_indexing = False
         self._pending_scope_rebuild = False
-        self._asset_catalog: AssetCatalog = None
 
         self.settings = QSettings("ModOrganizer2", "FullModSearchPlugin")
 
@@ -129,6 +128,7 @@ class NifTextureSearchTab(QWidget):
         input_row.addWidget(self._search_input)
 
         self._search_btn = QPushButton("🔍 Search")
+        self._search_btn.setEnabled(False)
         input_row.addWidget(self._search_btn)
 
         search_layout.addLayout(input_row)
@@ -256,19 +256,14 @@ class NifTextureSearchTab(QWidget):
             else ""
         )
 
-    def _current_scope(self) -> dict:
-        include_bsas = self._include_bsas_cb.isChecked()
-        only_active = self._active_only_cb.isChecked() and not include_bsas
-        return build_index_scope(self._organizer, include_bsas, only_active)
-
     def _on_include_bsas_toggled(self, checked: bool) -> None:
         self.settings.setValue(f"{self.SETTINGS_KEY}/IncludeBSAs", checked)
         self.settings.sync()
         self._apply_scope_controls()
-        self._asset_catalog = None
         self.include_bsas_changed.emit(checked)
         self._index.clear()
         self._update_index_status()
+        self._search_btn.setEnabled(False)
         if self._is_indexing:
             self._pending_scope_rebuild = True
             self._stop_indexing()
@@ -278,9 +273,9 @@ class NifTextureSearchTab(QWidget):
     def _on_active_only_toggled(self, _checked: bool) -> None:
         if self._include_bsas_cb.isChecked():
             return
-        self._asset_catalog = None
         self._index.clear()
         self._update_index_status()
+        self._search_btn.setEnabled(False)
         if self._is_indexing:
             self._pending_scope_rebuild = True
             self._stop_indexing()
@@ -299,14 +294,7 @@ class NifTextureSearchTab(QWidget):
         )
         if self._first_activation:
             self._first_activation = False
-
-            scope = self._current_scope()
-            self._index.set_scope(scope)
-            if self._index.load_from_cache(scope):
-                self._update_index_status()
-                self.status_changed.emit(f"Index loaded: {self._index.nif_count} NIFs")
-            else:
-                QTimer.singleShot(100, lambda: self._start_indexing(force_rebuild=True))
+            QTimer.singleShot(100, lambda: self._start_indexing(force_rebuild=False))
 
     def _start_indexing(self, force_rebuild: bool = False) -> None:
         if self._is_indexing:
@@ -314,7 +302,6 @@ class NifTextureSearchTab(QWidget):
 
         if force_rebuild:
             self._index.clear()
-        self._index.set_scope(self._current_scope())
 
         self._is_indexing = True
         self._rebuild_btn.setEnabled(False)
@@ -325,7 +312,7 @@ class NifTextureSearchTab(QWidget):
         self._progress_label.setVisible(True)
 
         self._index_icon.setText("🔄")
-        self._index_status.setText("Indexing NIF files...")
+        self._index_status.setText("Preparing index...")
 
         include_bsas = self._include_bsas_cb.isChecked()
         only_active = self._active_only_cb.isChecked() and not include_bsas
@@ -339,7 +326,8 @@ class NifTextureSearchTab(QWidget):
         )
 
         self._index_worker.progress.connect(self._on_index_progress)
-        self._index_worker.entry_ready.connect(self._on_entry_ready)
+        self._index_worker.phase.connect(self._on_index_phase)
+        self._index_worker.index_ready.connect(self._on_index_ready)
         self._index_worker.finished.connect(self._on_index_finished)
         self._index_worker.error.connect(self._on_index_error)
         self._index_worker.warning.connect(self._on_index_warning)
@@ -356,22 +344,32 @@ class NifTextureSearchTab(QWidget):
             self._progress_label.setText("Stopping...")
 
     def _on_index_progress(self, current: int, total: int, filename: str) -> None:
-        self._progress_bar.setMaximum(total)
-        self._progress_bar.setValue(current)
-        self._progress_label.setText(f"{current}/{total}: {filename}")
+        if total > 0:
+            self._progress_bar.setMaximum(total)
+            self._progress_bar.setValue(current)
+            self._progress_label.setText(f"{current}/{total}: {filename}")
+        else:
+            self._progress_bar.setMaximum(0)
+            self._progress_label.setText(f"{current}: {filename}")
 
-    def _on_entry_ready(self, entry: NifTextureEntry) -> None:
-        self._index.add_entry(entry)
+    def _on_index_phase(self, message: str) -> None:
+        self._index_status.setText(message)
+        self._progress_label.setText(message)
+
+    def _on_index_ready(self, index: NifTextureIndex, loaded_from_cache: bool) -> None:
+        if self._pending_scope_rebuild:
+            return
+        self._index = index
+        if loaded_from_cache:
+            self.status_changed.emit(f"Index loaded: {self._index.nif_count} NIFs")
 
     def _on_index_finished(self, total_nifs: int, total_textures: int) -> None:
         self._is_indexing = False
         self._rebuild_btn.setEnabled(True)
         self._stop_btn.setEnabled(False)
-        self._search_btn.setEnabled(True)
+        self._search_btn.setEnabled(self._index.is_loaded and not self._pending_scope_rebuild)
         self._progress_bar.setVisible(False)
         self._progress_label.setVisible(False)
-
-        self._index.save_to_cache()
 
         self._update_index_status()
         self.status_changed.emit(
@@ -389,7 +387,7 @@ class NifTextureSearchTab(QWidget):
         self._is_indexing = False
         self._rebuild_btn.setEnabled(True)
         self._stop_btn.setEnabled(False)
-        self._search_btn.setEnabled(True)
+        self._search_btn.setEnabled(self._index.is_loaded)
         self._progress_bar.setVisible(False)
         self._progress_label.setVisible(False)
 
@@ -495,7 +493,7 @@ class NifTextureSearchTab(QWidget):
 
         if not results:
             self._results_label.setText("No NIFs found using this texture")
-            self._check_texture_exists(query)
+            self._show_dds_search_summary(query, [], [], [], [])
             return
 
         high = [(e, s) for e, s in results if s >= 70]
@@ -538,55 +536,26 @@ class NifTextureSearchTab(QWidget):
         add_group("Possible matches", low, "❓")
 
         self._results_label.setText(f"{len(results)} NIFs found")
-        self._check_texture_exists(query)
+        self._show_dds_search_summary(query, results, high, medium, low)
 
-    def _check_texture_exists(self, texture_path: str) -> None:
-        self._add_detail("--- Texture Check ---", "")
-
-        normalized = texture_path.lower().replace("\\", "/")
-        if not normalized.startswith("textures/"):
-            normalized = f"textures/{normalized}"
-        if not normalized.endswith(".dds"):
-            normalized += ".dds"
-
-        if self._include_bsas_cb.isChecked():
-            if self._asset_catalog is None:
-                self._asset_catalog = AssetCatalog(
-                    self._organizer,
-                    include_archives=True,
-                    exhaustive=True,
-                )
-            matches = self._asset_catalog.find_virtual_path(normalized)
-            if matches:
-                self._add_detail("Status", f"Found ({len(matches)} providers)")
-                for number, source in enumerate(matches, start=1):
-                    self._add_detail(
-                        f"Source {number}",
-                        f"{source.owner}: {source.location_text}",
-                    )
-            else:
-                self._add_detail("Status", "NOT FOUND")
-                self._add_detail("Query", texture_path)
-                self._add_detail("Note", "Not present in loose files or BSAs")
-            return
-
-        resolved = self._organizer.resolvePath(normalized)
-
-        if resolved and Path(resolved).exists():
-            self._add_detail("Status", "✅ Found")
-            self._add_detail("Path", resolved)
-
-            mods_path = Path(self._organizer.modsPath())
-            try:
-                rel = Path(resolved).relative_to(mods_path)
-                mod_name = rel.parts[0]
-                self._add_detail("Mod", mod_name)
-            except ValueError:
-                self._add_detail("Mod", "[Game Data]")
+    def _show_dds_search_summary(
+        self,
+        query: str,
+        results: list,
+        high: list,
+        medium: list,
+        low: list,
+    ) -> None:
+        self._add_detail("--- DDS -> NIF Search ---", "")
+        self._add_detail("Query", query)
+        self._add_detail("Matching NIFs", str(len(results)))
+        self._add_detail("Exact", str(len(high)))
+        self._add_detail("Partial", str(len(medium)))
+        self._add_detail("Possible", str(len(low)))
+        if results:
+            self._add_detail("Details", "Select a NIF to inspect referenced texture paths")
         else:
-            self._add_detail("Status", "❌ NOT FOUND")
-            self._add_detail("Query", texture_path)
-            self._add_detail("Note", "Missing or in disabled mod")
+            self._add_detail("Details", "No indexed NIF references matched this query")
 
     def _add_detail(self, key: str, value: str) -> None:
         item = QTreeWidgetItem([key, value])
@@ -621,7 +590,25 @@ class NifTextureSearchTab(QWidget):
         self._add_detail("Source", "BSA" if entry.source_kind == "bsa" else "Loose file")
         if entry.source_kind == "bsa":
             self._add_detail("Archive", entry.container_path)
-        self._add_detail("Textures", str(len(entry.textures)))
+        self._add_detail("Texture Count", str(len(entry.textures)))
+
+        preview = "; ".join(entry.textures[:3])
+        if len(entry.textures) > 3:
+            preview += f"; ... (+{len(entry.textures) - 3} more)"
+        self._add_detail("Textures", preview or "None")
+
+        self._add_detail("--- Texture Paths ---", "")
+        for texture_path in entry.textures[:20]:
+            providers = self._index.find_texture_providers(texture_path)
+            if providers:
+                self._add_detail(
+                    "Found",
+                    f"{texture_path} -> {self._format_provider_preview(providers)}",
+                )
+            else:
+                self._add_detail("Missing", texture_path)
+        if len(entry.textures) > 20:
+            self._add_detail("...", f"+{len(entry.textures) - 20} more")
 
     def _show_texture_details(self, data: dict) -> None:
         self._add_detail("--- Texture Info ---", "")
@@ -631,6 +618,34 @@ class NifTextureSearchTab(QWidget):
             self._add_detail("NIF", entry.relative_path)
             self._add_detail("Mod", entry.mod_name)
             self._add_detail("Source", "BSA" if entry.source_kind == "bsa" else "Loose file")
+        self._show_texture_providers(data.get("path", ""))
+
+    @staticmethod
+    def _provider_label(source: AssetSource) -> str:
+        if source.source_kind == "bsa":
+            archive = source.archive_name or Path(source.container_path).name
+            return f"{source.owner} [{archive}]"
+        return f"{source.owner} [Loose]"
+
+    def _format_provider_preview(self, providers: list[AssetSource]) -> str:
+        labels = [self._provider_label(source) for source in providers[:2]]
+        if len(providers) > 2:
+            labels.append(f"+{len(providers) - 2} more")
+        return "; ".join(labels)
+
+    def _show_texture_providers(self, texture_path: str) -> None:
+        self._add_detail("--- Providers ---", "")
+        providers = self._index.find_texture_providers(texture_path)
+        if not providers:
+            self._add_detail("Status", "Not found in indexed sources")
+            return
+
+        self._add_detail("Status", f"Found ({len(providers)} providers)")
+        for number, provider in enumerate(providers, start=1):
+            self._add_detail(
+                f"Provider {number}",
+                f"{self._provider_label(provider)}: {provider.location_text}",
+            )
 
     @staticmethod
     def _entry_location(entry: NifTextureEntry) -> str:
@@ -721,7 +736,7 @@ class NifTextureSearchTab(QWidget):
         if not file_path:
             if entry.is_game:
                 return
-            mod_info = self._organizer.getMod(entry.mod_name)
+            mod_info = self._mod_list.getMod(entry.mod_name)
             if not mod_info:
                 return
             file_path = os.path.join(mod_info.absolutePath(), entry.relative_path)

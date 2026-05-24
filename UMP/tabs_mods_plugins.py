@@ -956,7 +956,7 @@ class ModNotesSearchTab(QWidget):
                 display_name = self.mod_list.displayName(internal_name)
                 mod_info = None
                 try:
-                    mod_info = self._organizer.getMod(internal_name)
+                    mod_info = self.mod_list.getMod(internal_name)
                 except Exception:
                     mod_info = None
 

@@ -81,7 +81,7 @@ class UnifiedSearchDialog(QDialog):
         layout.addWidget(self.tab_widget)
 
         self.status_label = QLabel(
-            "F3 to open | Tabs: Mods, Plugins, Files, NIF↔DDS | Escape to close",
+            "F1 to open | Tabs: Mods, Plugins, Files, NIF↔DDS | Escape to close",
             self,
         )
         layout.addWidget(self.status_label)
