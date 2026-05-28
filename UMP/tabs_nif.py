@@ -53,6 +53,7 @@ class NifTextureSearchTab(QWidget):
         self._first_activation = True
         self._is_indexing = False
         self._pending_scope_rebuild = False
+        self._pending_external_texture_query = ""
 
         self.settings = QSettings("ModOrganizer2", "FullModSearchPlugin")
 
@@ -296,6 +297,38 @@ class NifTextureSearchTab(QWidget):
             self._first_activation = False
             QTimer.singleShot(100, lambda: self._start_indexing(force_rebuild=False))
 
+    def find_nif_references(self, texture_path: str) -> bool:
+        query = (texture_path or "").strip()
+        if not query:
+            return False
+
+        self._pending_external_texture_query = query
+        self._dds_to_nif_radio.setChecked(True)
+        self._search_input.setText(query)
+        self.focus_search()
+        self.refresh_if_needed()
+
+        if self._index.is_loaded and not self._is_indexing and not self._pending_scope_rebuild:
+            self._pending_external_texture_query = ""
+            QTimer.singleShot(0, self._do_search)
+        elif not self._is_indexing and not self._first_activation:
+            self._start_indexing(force_rebuild=False)
+
+        self.status_changed.emit(f"Queued DDS -> NIF search: {query}")
+        return True
+
+    def _run_pending_external_search(self) -> None:
+        if not self._pending_external_texture_query:
+            return
+        if not self._index.is_loaded or self._pending_scope_rebuild:
+            return
+        query = self._pending_external_texture_query
+        self._pending_external_texture_query = ""
+        self._dds_to_nif_radio.setChecked(True)
+        self._search_input.setText(query)
+        self.focus_search()
+        self._do_search()
+
     def _start_indexing(self, force_rebuild: bool = False) -> None:
         if self._is_indexing:
             return
@@ -379,6 +412,8 @@ class NifTextureSearchTab(QWidget):
         if self._pending_scope_rebuild:
             self._pending_scope_rebuild = False
             QTimer.singleShot(0, lambda: self._start_indexing(force_rebuild=True))
+        elif self._pending_external_texture_query:
+            QTimer.singleShot(0, self._run_pending_external_search)
 
     def _on_index_warning(self, message: str) -> None:
         self.status_changed.emit(f"Archive warning: {message}")
@@ -393,6 +428,7 @@ class NifTextureSearchTab(QWidget):
 
         self._index_icon.setText("❌")
         self._index_status.setText(f"Error: {message}")
+        self._pending_external_texture_query = ""
         self.status_changed.emit(f"Index error: {message}")
 
     def _update_index_status(self) -> None:

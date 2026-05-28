@@ -15,7 +15,8 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from .tabs import FileSearchTab, ModNameSearchTab, ModNotesSearchTab, NifTextureSearchTab, PluginSearchTab, ContentFilterTab
+from .tabs import FileSearchTab, ModNameSearchTab, ModNotesSearchTab, PluginSearchTab, ContentFilterTab
+from .tabs_nif import NifTextureSearchTab
 from .esp_search_tab import EspFieldSearchTab
 from .bookmarks_tab import BookmarksTab
 
@@ -276,6 +277,19 @@ class AdvancedSearchDock(QDockWidget):
         current_tab = self._get_current_tab()
         if current_tab and hasattr(current_tab, "focus_search"):
             current_tab.focus_search()
+
+    def find_nif_references(self, texture_path: str) -> bool:
+        if not self.nif_texture_tab:
+            return False
+        try:
+            index = self._tab_objects.index(self.nif_texture_tab)
+            self.tab_widget.setCurrentIndex(index)
+        except ValueError:
+            pass
+        self.setVisible(True)
+        self.raise_()
+        self.activateWindow()
+        return bool(self.nif_texture_tab.find_nif_references(texture_path))
 
     def _install_title_click_handler(self) -> None:
         bar = self.titleBarWidget()

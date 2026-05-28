@@ -102,6 +102,7 @@ class FullModSearchPlugin(mobase.IPlugin):
 
         app = QApplication.instance()
         if app:
+            setattr(app, "ump_find_nif_references", self.find_nif_references)
             app.aboutToQuit.connect(self._save_main_window_state)
 
     def _show_search(self) -> None:
@@ -110,6 +111,12 @@ class FullModSearchPlugin(mobase.IPlugin):
             self._dock.raise_()
             self._dock.activateWindow()
             self._dock.focus_current_tab_search()
+
+    def find_nif_references(self, texture_path: str) -> bool:
+        if not self._dock:
+            return False
+        self._show_search()
+        return bool(self._dock.find_nif_references(texture_path))
 
     def _toggle_dock(self) -> None:
         if not self._dock:

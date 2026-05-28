@@ -54,6 +54,19 @@ class FollowupStaticTests(unittest.TestCase):
         self.assertIn("self._on_plugin_state_changed", autoscroller_source)
         self.assertNotIn("lambda *_:", autoscroller_source)
 
+    def test_dds_preview_external_handoff_bridge(self) -> None:
+        plugin_source = _read("UMP/plugin.py")
+        dock_source = _read("UMP/dock_widget.py")
+        tab_source = _read("UMP/tabs_nif.py")
+
+        self.assertIn('setattr(app, "ump_find_nif_references"', plugin_source)
+        self.assertIn("def find_nif_references(self, texture_path: str) -> bool:", plugin_source)
+        self.assertIn("from .tabs_nif import NifTextureSearchTab", dock_source)
+        self.assertIn("self.tab_widget.setCurrentIndex(index)", dock_source)
+        self.assertIn("_pending_external_texture_query", tab_source)
+        self.assertIn("self._dds_to_nif_radio.setChecked(True)", tab_source)
+        self.assertIn("QTimer.singleShot(0, self._run_pending_external_search)", tab_source)
+
 
 if __name__ == "__main__":
     unittest.main()
