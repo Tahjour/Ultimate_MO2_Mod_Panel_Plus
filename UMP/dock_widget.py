@@ -183,6 +183,7 @@ class AdvancedSearchDock(QDockWidget):
 
         app = QApplication.instance()
         if app:
+            setattr(app, "ump_find_nif_references", self.find_nif_references)
             app.aboutToQuit.connect(self._save_state)
 
     def _add_tab(self, tab: QWidget, title: str) -> None:

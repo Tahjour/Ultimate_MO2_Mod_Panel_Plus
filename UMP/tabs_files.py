@@ -26,6 +26,7 @@ from PyQt6.QtWidgets import (
 
 from .workers import FileSearchWorker
 from .archive_core import AssetSource, GAME_DATA_OWNER
+from .preview_bridge import can_preview_virtual_path, preview_asset_source
 
 
 class CollapsibleSplitter(QSplitter):
@@ -225,6 +226,10 @@ class FileSearchTab(QWidget):
         self.goto_mod_btn.setEnabled(False)
         info_layout.addWidget(self.goto_mod_btn)
 
+        self.preview_btn = QPushButton("Preview", self)
+        self.preview_btn.setEnabled(False)
+        info_layout.addWidget(self.preview_btn)
+
         self.open_folder_btn = QPushButton("Open Folder", self)
         self.open_folder_btn.setEnabled(False)
         info_layout.addWidget(self.open_folder_btn)
@@ -281,6 +286,7 @@ class FileSearchTab(QWidget):
         self.results_tree.itemDoubleClicked.connect(self._on_item_double_clicked)
 
         self.goto_mod_btn.clicked.connect(self._goto_selected_mod)
+        self.preview_btn.clicked.connect(self._preview_selected_file)
         self.open_folder_btn.clicked.connect(self._open_selected_folder)
 
         self.recent_list.itemDoubleClicked.connect(self._on_recent_clicked)
@@ -406,6 +412,7 @@ class FileSearchTab(QWidget):
         self._result_file_count = 0
         self.results_label.setText("No results")
         self.goto_mod_btn.setEnabled(False)
+        self.preview_btn.setEnabled(False)
         self.open_folder_btn.setEnabled(False)
 
     def _on_search_progress(self, current: int, total: int):
@@ -469,12 +476,14 @@ class FileSearchTab(QWidget):
         items = self.results_tree.selectedItems()
         if not items:
             self.goto_mod_btn.setEnabled(False)
+            self.preview_btn.setEnabled(False)
             self.open_folder_btn.setEnabled(False)
             return
         data = items[0].data(0, Qt.ItemDataRole.UserRole) or {}
         source = data.get("source")
         owner = source.owner if source else data.get("name")
         self.goto_mod_btn.setEnabled(bool(owner and owner != GAME_DATA_OWNER))
+        self.preview_btn.setEnabled(bool(source and can_preview_virtual_path(source.virtual_path)))
         self.open_folder_btn.setEnabled(True)
 
     def _on_item_double_clicked(self, item: QTreeWidgetItem, column: int):
@@ -486,9 +495,7 @@ class FileSearchTab(QWidget):
             if data["name"] != GAME_DATA_OWNER:
                 self._goto_mod(data["name"])
         else:
-            source = data["source"]
-            if not source.is_game:
-                self._goto_mod(source.owner)
+            self._preview_source(data["source"])
 
     def _goto_selected_mod(self):
         items = self.results_tree.selectedItems()
@@ -543,6 +550,21 @@ class FileSearchTab(QWidget):
             self.file_selected.emit(f"Selected: {display_name}")
         else:
             self.file_selected.emit(f"Could not find mod: {display_name}")
+
+    def _preview_selected_file(self):
+        items = self.results_tree.selectedItems()
+        if not items:
+            return
+
+        data = items[0].data(0, Qt.ItemDataRole.UserRole)
+        if not data or data.get("type") != "file":
+            return
+
+        self._preview_source(data["source"])
+
+    def _preview_source(self, source: AssetSource):
+        if preview_asset_source(self, source, self._organizer):
+            self.file_selected.emit(f"Preview: {source.virtual_path}")
 
     def _open_selected_folder(self):
         items = self.results_tree.selectedItems()

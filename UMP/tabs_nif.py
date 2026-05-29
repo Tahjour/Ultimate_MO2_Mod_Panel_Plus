@@ -26,6 +26,7 @@ from PyQt6.QtWidgets import (
 
 from .nif_core import NifTextureEntry, NifTextureIndex, NifIndexWorker
 from .archive_core import AssetSource
+from .preview_bridge import can_preview_virtual_path, preview_asset_source, preview_nif_entry
 
 
 class NifTextureSearchTab(QWidget):
@@ -213,6 +214,10 @@ class NifTextureSearchTab(QWidget):
         self._goto_btn.setEnabled(False)
         bottom_row.addWidget(self._goto_btn)
 
+        self._preview_btn = QPushButton("Preview")
+        self._preview_btn.setEnabled(False)
+        bottom_row.addWidget(self._preview_btn)
+
         self._open_folder_btn = QPushButton("📂 Open Folder")
         self._open_folder_btn.setEnabled(False)
         bottom_row.addWidget(self._open_folder_btn)
@@ -242,6 +247,7 @@ class NifTextureSearchTab(QWidget):
 
         self._copy_btn.clicked.connect(self._copy_results)
         self._goto_btn.clicked.connect(self._goto_selected_mod)
+        self._preview_btn.clicked.connect(self._preview_selected_result)
         self._open_folder_btn.clicked.connect(self._open_selected_folder)
 
         self._nif_to_dds_radio.toggled.connect(self._on_mode_changed)
@@ -468,6 +474,7 @@ class NifTextureSearchTab(QWidget):
         self._results_tree.clear()
         self._details_tree.clear()
         self._goto_btn.setEnabled(False)
+        self._preview_btn.setEnabled(False)
         self._open_folder_btn.setEnabled(False)
 
         if self._nif_to_dds_radio.isChecked():
@@ -609,13 +616,16 @@ class NifTextureSearchTab(QWidget):
         if item_type == "nif":
             self._show_nif_details(data["entry"])
             self._goto_btn.setEnabled(not data["entry"].is_game)
+            self._preview_btn.setEnabled(True)
             self._open_folder_btn.setEnabled(True)
         elif item_type == "texture":
             self._show_texture_details(data)
             self._goto_btn.setEnabled(not data["nif_entry"].is_game)
+            self._preview_btn.setEnabled(can_preview_virtual_path(data.get("path", "")))
             self._open_folder_btn.setEnabled(True)
         else:
             self._goto_btn.setEnabled(False)
+            self._preview_btn.setEnabled(False)
             self._open_folder_btn.setEnabled(False)
 
     def _show_nif_details(self, entry: NifTextureEntry) -> None:
@@ -700,14 +710,7 @@ class NifTextureSearchTab(QWidget):
         if not data:
             return
 
-        entry = None
-        if data.get("type") == "nif":
-            entry = data["entry"]
-        elif data.get("type") == "texture":
-            entry = data.get("nif_entry")
-
-        if entry and not entry.is_game:
-            self._goto_mod_in_view(entry.mod_name)
+        self._preview_result_data(data)
 
     def _goto_mod_in_view(self, mod_name: str) -> None:
         if not self._mods_view or not self._mods_view.model():
@@ -749,6 +752,34 @@ class NifTextureSearchTab(QWidget):
             self.goto_mod.emit(mod_name)
         else:
             self.status_changed.emit(f"Could not find mod: {display_name}")
+
+    def _preview_selected_result(self) -> None:
+        items = self._results_tree.selectedItems()
+        if not items:
+            return
+
+        data = items[0].data(0, Qt.ItemDataRole.UserRole)
+        if not data:
+            return
+
+        self._preview_result_data(data)
+
+    def _preview_result_data(self, data: dict) -> None:
+        item_type = data.get("type")
+        if item_type == "nif":
+            entry = data.get("entry")
+            if preview_nif_entry(self, entry, self._organizer) and entry:
+                self.status_changed.emit(f"Preview: {entry.relative_path}")
+            return
+
+        if item_type == "texture":
+            texture_path = data.get("path", "")
+            providers = self._index.find_texture_providers(texture_path)
+            if not providers:
+                QMessageBox.information(self, "Preview", "No indexed DDS provider was found for this texture.")
+                return
+            if preview_asset_source(self, providers[0], self._organizer):
+                self.status_changed.emit(f"Preview: {texture_path}")
 
     def _open_selected_folder(self) -> None:
         items = self._results_tree.selectedItems()

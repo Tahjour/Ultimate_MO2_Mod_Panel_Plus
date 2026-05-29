@@ -67,6 +67,21 @@ class FollowupStaticTests(unittest.TestCase):
         self.assertIn("self._dds_to_nif_radio.setChecked(True)", tab_source)
         self.assertIn("QTimer.singleShot(0, self._run_pending_external_search)", tab_source)
 
+    def test_file_and_nif_results_expose_preview_actions(self) -> None:
+        file_source = _read("UMP/tabs_files.py")
+        nif_source = _read("UMP/tabs_nif.py")
+        bridge_source = _read("UMP/preview_bridge.py")
+
+        self.assertIn('QPushButton("Preview"', file_source)
+        self.assertIn('QPushButton("Preview"', nif_source)
+        self.assertIn("itemDoubleClicked.connect(self._on_item_double_clicked)", file_source)
+        self.assertIn("itemDoubleClicked.connect(self._on_result_double_clicked)", nif_source)
+        self.assertIn("preview_asset_source", file_source)
+        self.assertIn("preview_nif_entry", nif_source)
+        self.assertIn("def preview_asset_source", bridge_source)
+        self.assertIn("genFilePreview", bridge_source)
+        self.assertIn("genDataPreview", bridge_source)
+
 
 if __name__ == "__main__":
     unittest.main()
