@@ -65,7 +65,15 @@ class WinnerTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def test_winner_before_matching_inactive_and_identical_basenames(self):
+    def run_search(self, organizer, query, nif=False, session=None):
+        worker = search.NifSearchWorker(organizer, self.index, query, nif, 3, session)
+        worker.ready = _CaptureSignal()
+        worker.failed = _CaptureSignal()
+        worker.run()
+        self.assertEqual(worker.failed.calls, [])
+        return worker.ready.calls[0][1]
+
+    def test_losing_matches_inactive_paths_and_identical_basenames(self):
         loser = mesh("Low", textures=["textures/old.dds"])
         winner = mesh("High", textures=["textures/new.dds"])
         disabled = mesh("Disabled", "meshes/inactive.nif")
@@ -74,22 +82,29 @@ class WinnerTests(unittest.TestCase):
             self.index.add_entry(entry)
         organizer = FakeOrganizer({winner.relative_path: info(winner, ["High", "Low"]),
                                    other.relative_path: info(other)})
-        snapshot = search.ProfileResolver(organizer).snapshot(self.index)
-        self.assertEqual(snapshot.index.nif_count, 2)
-        self.assertEqual(snapshot.index.find_nifs_by_texture("old.dds"), [])
-        self.assertEqual(snapshot.index.find_nifs_by_texture("new.dds")[0][0].mod_name, "High")
+        result = self.run_search(organizer, "textures/old.dds")["results"][0]
+        self.assertEqual(result.winner.entry.mod_name, "High")
+        self.assertEqual(result.winner.score, 0)
+        self.assertEqual(result.versions[1].score, 100)
+        groups = self.run_search(organizer, "item.nif", nif=True)["results"]
+        self.assertEqual(len(groups), 2)
+        self.assertEqual(len({group.virtual_path for group in groups}), 2)
+        inactive_group = self.run_search(organizer, "inactive.nif", nif=True)["results"][0]
+        self.assertIsNone(inactive_group.winner)
+        self.assertFalse(inactive_group.versions[0].provider.active)
 
-    def test_textureless_and_unreadable_winners_never_use_losing_references(self):
+    def test_textureless_and_unreadable_winners_keep_independent_scores(self):
         for error in ("", "Corrupt archive member"):
             with self.subTest(error=error):
                 self.index.clear()
                 winner = mesh("High", textures=[], error=error)
                 self.index.add_entry(mesh("Low"))
                 self.index.add_entry(winner)
-                snapshot = search.ProfileResolver(FakeOrganizer({winner.relative_path: info(winner)})).snapshot(self.index)
-                self.assertEqual(snapshot.index.find_nifs_by_texture("item.dds"), [])
-                self.assertEqual(len(snapshot.index.find_textures_by_nif("item.nif")), 1)
-                self.assertEqual(bool(snapshot.warnings), bool(error))
+                payload = self.run_search(FakeOrganizer({winner.relative_path: info(winner)}), "textures/item.dds")
+                group = payload["results"][0]
+                self.assertEqual(group.winner.score, None if error else 0)
+                self.assertEqual(group.versions[1].score, 100)
+                self.assertEqual(bool(payload["snapshot"].warnings), bool(error))
 
     def test_actual_bsa_container_wins_over_mod_priority_and_unloaded_archive(self):
         loose = mesh("High")
@@ -99,8 +114,9 @@ class WinnerTests(unittest.TestCase):
         organizer.archives["loaded.bsa"] = bsa.container_path
         for entry in (loose, bsa, unloaded):
             self.index.add_entry(entry)
-        snapshot = search.ProfileResolver(organizer).snapshot(self.index)
-        self.assertEqual(snapshot.index.entries()[0].container_path, bsa.container_path)
+        group = self.run_search(organizer, "item.nif", nif=True)["results"][0]
+        self.assertEqual(group.winner.entry.container_path, bsa.container_path)
+        self.assertFalse(next(v for v in group.versions if v.entry is unloaded).provider.loaded)
 
     def test_provider_order_and_missing_when_only_inactive_providers_exist(self):
         texture = "textures/item.dds"
@@ -136,9 +152,10 @@ class WinnerTests(unittest.TestCase):
     def test_unindexed_winner_is_reported_without_fallback(self):
         self.index.add_entry(mesh("Low"))
         high = mesh("High")
-        snapshot = search.ProfileResolver(FakeOrganizer({high.relative_path: info(high)})).snapshot(self.index)
-        self.assertEqual(snapshot.index.nif_count, 0)
-        self.assertIn("Unindexed", snapshot.warnings[0])
+        payload = self.run_search(FakeOrganizer({high.relative_path: info(high)}), "item.nif", nif=True)
+        self.assertIsNone(payload["results"][0].winner)
+        self.assertEqual(payload["results"][0].winner_origin, "High")
+        self.assertIn("Unindexed", payload["snapshot"].warnings[0])
 
     def test_cache_migration_and_empty_error_entries(self):
         self.index.add_entry(mesh("High", textures=[], error="read failed"))
@@ -166,12 +183,125 @@ class WinnerTests(unittest.TestCase):
         self.assertEqual(worker.failed.calls, [])
         generation, payload = worker.ready.calls[0]
         self.assertEqual((generation, payload["total"], len(payload["results"])), (3, 105, 100))
+        self.assertEqual(len(payload["results"][0].versions), 2)
         self.assertEqual(self.index.nif_count, 210)
         cancelled = search.NifSearchWorker(FakeOrganizer(infos), self.index, "item", True, 4)
         cancelled.ready = _CaptureSignal()
         cancelled.cancel()
         cancelled.run()
         self.assertEqual(cancelled.ready.calls, [])
+
+    def test_coffin_exact_child_and_close_parent(self):
+        query = "textures/dlc01/architecture/hearse/coffin01.dds"
+        path = "meshes/_byoh/architecture/byohhouse/coffin/byohcoffin01.nif"
+        winner = mesh("High", path, ["textures/pbr/dlc01/architecture/hearse/coffin01.dds"])
+        loser = mesh("Low", path, [query])
+        self.index.add_entry(loser)
+        self.index.add_entry(winner)
+        payload = self.run_search(FakeOrganizer({path: info(winner, ["High", "Low"])}), query)
+        group = payload["results"][0]
+        self.assertEqual((group.best_score, group.winner.score), (100, 80))
+        self.assertEqual([v.score for v in group.versions], [80, 100])
+        self.assertEqual(payload["counts"]["Exact Match"], 1)
+        self.assertEqual(payload["counts"]["Close Match"], 0)
+
+    def test_match_category_boundaries_and_full_nif_path(self):
+        self.assertEqual([search.match_label(n) for n in (None, 0, 1, 69, 70, 99, 100)],
+                         ["Unreadable", "No Match", "Partial Match", "Partial Match",
+                          "Close Match", "Close Match", "Exact Match"])
+        winner = mesh("High")
+        self.index.add_entry(winner)
+        self.assertEqual(self.index.find_textures_by_nif("MESHES\\ITEM.NIF")[0][1], 100)
+
+    def test_warm_queries_reuse_metadata_and_do_not_resolve_unrelated_textures(self):
+        entry = mesh("High")
+        other = mesh("High", "meshes/unrelated/other.nif", ["textures/unrelated/other.dds"])
+        self.index.add_entry(entry)
+        self.index.add_entry(other)
+        organizer = FakeOrganizer({entry.relative_path: info(entry), other.relative_path: info(other)})
+        session = search.ResolutionSession(organizer, self.index)
+        first = self.run_search(organizer, "textures/item.dds", session=session)
+        calls = list(organizer.calls)
+        second = self.run_search(organizer, "item.nif", nif=True, session=session)
+        self.assertEqual(organizer.calls, calls)
+        self.assertEqual(calls, ["meshes"])
+        self.assertEqual(first["snapshot"].textures, {})
+        self.assertIs(second["snapshot"].index, self.index)
+        worker = search.TextureResolutionWorker(session, entry.textures, 10)
+        worker.ready, worker.failed = _CaptureSignal(), _CaptureSignal()
+        worker.run()
+        self.assertEqual(worker.failed.calls, [])
+        self.assertEqual(organizer.calls, ["meshes", "textures"])
+        self.assertEqual(worker.ready.calls[0][1], {"item.dds": ((), ())})
+        worker.run()
+        self.assertEqual(organizer.calls, ["meshes", "textures"])
+
+    def test_new_session_reflects_priority_change_and_cancelled_lock_wait(self):
+        high, low = mesh("High"), mesh("Low")
+        self.index.add_entry(high)
+        self.index.add_entry(low)
+        organizer = FakeOrganizer({high.relative_path: info(high)})
+        old = search.ResolutionSession(organizer, self.index)
+        self.assertIs(self.run_search(organizer, "item", nif=True, session=old)["results"][0].winner.entry, high)
+        organizer.infos[high.relative_path] = info(low)
+        fresh = search.ResolutionSession(organizer, self.index)
+        self.assertIs(self.run_search(organizer, "item", nif=True, session=fresh)["results"][0].winner.entry, low)
+        fresh.lock.acquire()
+        try:
+            worker = search.NifSearchWorker(organizer, self.index, "item", True, 8, fresh)
+            worker.cancel()
+            worker.ready = _CaptureSignal()
+            worker.run()
+            self.assertEqual(worker.ready.calls, [])
+        finally:
+            fresh.lock.release()
+
+    def test_derived_lookup_maps_survive_update_removal_and_version5_cache(self):
+        high = mesh("High", textures=["textures/old.dds"])
+        self.index.add_entry(high)
+        replacement = mesh("High", textures=["textures/new.dds"])
+        self.index.add_entry(replacement)
+        self.assertEqual(self.index.mesh_versions(high.relative_path), [replacement])
+        self.assertEqual(self.index.find_nifs_by_texture("old.dds"), [])
+        self.assertTrue(self.index.save_to_cache())
+        loaded = nif_core.NifTextureIndex(Path(self.temp.name))
+        self.assertEqual(loaded.CACHE_VERSION, 5)
+        self.assertTrue(loaded.load_from_cache())
+        self.assertEqual(loaded.find_nifs_by_texture("new.dds")[0][0].mod_name, "High")
+        self.assertEqual(len(loaded.mesh_versions(high.relative_path)), 1)
+        loaded.invalidate_mod("High")
+        self.assertEqual(loaded.find_textures_by_nif("item"), [])
+        self.assertEqual(loaded.find_nifs_by_texture("new.dds"), [])
+
+    def test_selected_texture_resolves_loose_mod_bsa_game_bsa_and_missing(self):
+        texture = "textures/item.dds"
+        loose = archive_core.AssetSource("High", texture, "loose", "D:/mods/High/item.dds")
+        mod = archive_core.AssetSource("Low", texture, "bsa", "D:/mods/Low/Mod.bsa", archive_name="Mod.bsa")
+        game = archive_core.AssetSource("[Game Data]", texture, "bsa", "D:/game/Base.bsa", archive_name="Base.bsa", is_game=True)
+        for source in (game, mod, loose):
+            self.index.add_texture_provider(texture, source)
+        organizer = FakeOrganizer({texture: SimpleNamespace(filePath=loose.container_path, archive="", origins=["High", "Low", "data"])})
+        organizer.archives = {"mod.bsa": mod.container_path, "base.bsa": game.container_path}
+        session = search.ResolutionSession(organizer, self.index)
+        self.assertTrue(session.acquire(lambda: False))
+        try:
+            session.resolver.loaded_archives = {"mod.bsa": 1, "base.bsa": 0}
+            result = session.texture_providers([texture, "textures/missing.dds"], lambda: False)
+        finally:
+            session.lock.release()
+        self.assertEqual([p.source for p in result["item.dds"][0]], [loose, mod, game])
+        self.assertTrue(result["item.dds"][0][0].winning)
+        self.assertEqual(result["missing.dds"], ((), ()))
+
+    def test_cancelled_save_preserves_previous_cache_and_removes_temporary_file(self):
+        self.index.add_entry(mesh("High"))
+        self.assertTrue(self.index.save_to_cache())
+        cache = Path(self.temp.name) / "nif_texture_index.json"
+        before = cache.read_bytes()
+        self.index.add_entry(mesh("Low", "meshes/new.nif"))
+        self.assertFalse(self.index.save_to_cache(lambda: True))
+        self.assertEqual(cache.read_bytes(), before)
+        self.assertEqual(list(Path(self.temp.name).glob("*.tmp")), [])
 
 
 if __name__ == "__main__":

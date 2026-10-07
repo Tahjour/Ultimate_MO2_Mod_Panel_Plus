@@ -29,7 +29,7 @@ class FollowupStaticTests(unittest.TestCase):
 
     def test_nif_details_use_cached_providers_and_truthful_summary(self) -> None:
         source = _read("UMP/tabs_nif.py")
-        self.assertIn("def _show_dds_search_summary", source)
+        self.assertIn("def _show_search_summary", source)
         self.assertNotIn("def _check_texture_exists", source)
         self.assertNotIn("AssetCatalog", source)
         self.assertIn('"Texture Count"', source)

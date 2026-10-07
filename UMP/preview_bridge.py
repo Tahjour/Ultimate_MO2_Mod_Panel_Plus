@@ -80,7 +80,7 @@ def preview_nif_entry(parent: QWidget, entry, organizer=None) -> bool:
     if source is None:
         QMessageBox.information(parent, "Preview", "Could not resolve the selected NIF source.")
         return False
-    return preview_asset_source(parent, source, organizer)
+    return preview_asset_source(parent, source, organizer, exact_source=True)
 
 
 def asset_source_from_nif_entry(entry, organizer=None) -> Optional[AssetSource]:

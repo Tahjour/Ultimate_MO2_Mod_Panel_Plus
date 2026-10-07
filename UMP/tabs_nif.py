@@ -1,4 +1,5 @@
 import os
+import time
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QSettings, QTimer, pyqtSignal
@@ -25,7 +26,7 @@ from PyQt6.QtWidgets import (
 
 from .nif_core import NifTextureEntry, NifTextureIndex, NifIndexWorker
 from .archive_core import AssetSource
-from .nif_search import NifSearchWorker, entry_source
+from .nif_search import NifSearchWorker, TextureResolutionWorker, ResolutionSession, entry_source, match_label
 from .nif_tree_filter import AssetTreeFilter
 from .preview_bridge import can_preview_virtual_path, preview_asset_source, preview_nif_entry
 
@@ -60,6 +61,10 @@ class NifTextureSearchTab(QWidget):
         self._search_workers = []
         self._index_workers = []
         self._snapshot = None
+        self._resolution_session = None
+        self._texture_workers = []
+        self._details_generation = 0
+        self._details_data = None
         self._action_data = None
 
         self._last_query = ""
@@ -70,6 +75,17 @@ class NifTextureSearchTab(QWidget):
         self._setup_ui()
         self._connect_signals()
         self._subscribe_profile_changes()
+        app = QApplication.instance()
+        if app:
+            app.aboutToQuit.connect(self._shutdown_workers)
+
+    def _shutdown_workers(self):
+        self._profile_refresh_timer.stop()
+        workers = self._search_workers + self._texture_workers + self._index_workers
+        for worker in workers:
+            worker.cancel()
+        for worker in workers:
+            worker.wait()
 
     def _setup_ui(self) -> None:
         layout = QVBoxLayout(self)
@@ -159,18 +175,20 @@ class NifTextureSearchTab(QWidget):
         )
 
         self._results_tree = QTreeWidget()
-        self._results_tree.setHeaderLabels(["Item", "Score", "Winning Mod"])
+        self._results_tree.setHeaderLabels(["Match", "Item", "Score", "Mod / Source"])
         self._results_tree.setAlternatingRowColors(True)
         self._results_tree.setRootIsDecorated(True)
         self._results_tree.setIndentation(16)
         self._results_tree.setUniformRowHeights(True)
 
         header = self._results_tree.header()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
-        self._results_tree.setColumnWidth(1, 50)
-        self._results_tree.setColumnWidth(2, 260)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
+        self._results_tree.setColumnWidth(0, 130)
+        self._results_tree.setColumnWidth(2, 50)
+        self._results_tree.setColumnWidth(3, 300)
 
         results_layout.addWidget(self._results_tree)
 
@@ -203,7 +221,7 @@ class NifTextureSearchTab(QWidget):
         self._details_label = QLabel("")
         details_layout.addWidget(self._details_label)
         self._results_filter = AssetTreeFilter(
-            self._results_tree, self._results_filter_input, self._results_label, "nif"
+            self._results_tree, self._results_filter_input, self._results_label, "mesh"
         )
         self._details_filter = AssetTreeFilter(
             self._details_tree, self._details_filter_input, self._details_label, "texture"
@@ -328,7 +346,7 @@ class NifTextureSearchTab(QWidget):
         self._on_profile_dirty()
 
     def _on_profile_dirty(self):
-        self._invalidate_search()
+        self._invalidate_search(drop_session=True)
         self._clear_search_views()
         self._profile_refresh_timer.start()
 
@@ -344,10 +362,16 @@ class NifTextureSearchTab(QWidget):
         if self._last_query and self._index.is_loaded and not self._is_indexing:
             self._do_search()
 
-    def _invalidate_search(self):
+    def _invalidate_search(self, drop_session=False):
         self._search_generation += 1
         for worker in self._search_workers:
             worker.cancel()
+        self._details_generation += 1
+        for worker in self._texture_workers:
+            worker.cancel()
+        self._details_data = None
+        if drop_session:
+            self._resolution_session = None
         self._snapshot = None
         self._action_data = None
         if not self._is_indexing:
@@ -372,7 +396,7 @@ class NifTextureSearchTab(QWidget):
         )
 
     def _on_include_bsas_toggled(self, checked: bool) -> None:
-        self._invalidate_search()
+        self._invalidate_search(drop_session=True)
         self._clear_search_views()
         self.settings.setValue(f"{self.SETTINGS_KEY}/IncludeBSAs", checked)
         self.settings.sync()
@@ -390,7 +414,7 @@ class NifTextureSearchTab(QWidget):
     def _on_active_only_toggled(self, _checked: bool) -> None:
         if self._include_bsas_cb.isChecked():
             return
-        self._invalidate_search()
+        self._invalidate_search(drop_session=True)
         self._clear_search_views()
         self._index = NifTextureIndex(self._index.cache_dir)
         self._update_index_status()
@@ -451,7 +475,7 @@ class NifTextureSearchTab(QWidget):
         if self._is_indexing:
             return
 
-        self._invalidate_search()
+        self._invalidate_search(drop_session=True)
         self._clear_search_views()
         if force_rebuild:
             self._index = NifTextureIndex(self._index.cache_dir)
@@ -611,9 +635,12 @@ class NifTextureSearchTab(QWidget):
         generation = self._search_generation
         self._search_btn.setEnabled(False)
         self._stop_btn.setEnabled(True)
-        self._results_label.setText("Resolving current-profile winners...")
+        self._results_label.setText("Searching mesh versions...")
+        if self._resolution_session is None or self._resolution_session.index is not self._index:
+            self._resolution_session = ResolutionSession(self._organizer, self._index)
         worker = NifSearchWorker(
-            self._organizer, self._index, query, self._nif_to_dds_radio.isChecked(), generation
+            self._organizer, self._index, query, self._nif_to_dds_radio.isChecked(), generation,
+            self._resolution_session,
         )
         self._search_workers.append(worker)
         worker.ready.connect(self._on_search_ready)
@@ -639,27 +666,8 @@ class NifTextureSearchTab(QWidget):
             return
         self._snapshot = payload["snapshot"]
         results = payload["results"]
-        groups = {}
         nif_to_dds = payload["nif_to_dds"]
-        if not nif_to_dds:
-            for label, minimum, maximum in (("Exact matches", 70, 101),
-                                             ("Partial matches", 40, 70),
-                                             ("Possible matches", 0, 40)):
-                count = sum(minimum <= score < maximum for entry, score in results)
-                if count:
-                    group = QTreeWidgetItem([f"{label} ({count})", "", ""])
-                    group.setData(0, Qt.ItemDataRole.UserRole, {"type": "group"})
-                    self._results_tree.addTopLevelItem(group)
-                    group.setExpanded(True)
-                    groups[label] = group
-            high = [item for item in results if item[1] >= 70]
-            medium = [item for item in results if 40 <= item[1] < 70]
-            low = [item for item in results if item[1] < 40]
-            self._show_dds_search_summary(payload["query"], results, high, medium, low, payload["total"])
-        else:
-            self._add_detail("Query", payload["query"])
-            self._add_detail("Matching NIFs", str(payload["total"]))
-            self._add_detail("Details", "Select a NIF or referenced texture")
+        self._show_search_summary(payload)
         warnings = self._snapshot.warnings
         if warnings:
             self._add_detail("Resolution Warnings", f"{len(warnings)} (see tooltip)").setToolTip(
@@ -675,18 +683,18 @@ class NifTextureSearchTab(QWidget):
             if generation != self._search_generation:
                 return
             self._results_tree.setUpdatesEnabled(False)
+            end = offset
+            batch_started = time.perf_counter()
             try:
-                for entry, score in results[offset:offset + 40]:
-                    item = self._make_nif_item(entry, score, nif_to_dds)
-                    if nif_to_dds:
-                        self._results_tree.addTopLevelItem(item)
-                    else:
-                        name = "Exact matches" if score >= 70 else "Partial matches" if score >= 40 else "Possible matches"
-                        groups[name].addChild(item)
+                for group in results[offset:offset + 20]:
+                    self._results_tree.addTopLevelItem(self._make_mesh_group(group, nif_to_dds))
+                    end += 1
+                    if time.perf_counter() - batch_started >= 0.008:
+                        break
             finally:
                 self._results_tree.setUpdatesEnabled(True)
-            if offset + 40 < len(results):
-                QTimer.singleShot(0, lambda: append_batch(offset + 40))
+            if end < len(results):
+                QTimer.singleShot(0, lambda: append_batch(end))
             else:
                 if nif_to_dds and results:
                     self._results_tree.topLevelItem(0).setExpanded(True)
@@ -694,45 +702,60 @@ class NifTextureSearchTab(QWidget):
                 self._search_btn.setEnabled(True)
                 self._stop_btn.setEnabled(False)
                 self.status_changed.emit(
-                    f"{payload['total']} unique winning NIFs; {len(warnings)} resolution warnings"
+                    f"{payload['total']} unique mesh paths; {len(warnings)} resolution warnings"
                 )
         append_batch()
 
-    def _make_nif_item(self, entry, score, include_textures):
-        label = self._provider_label(entry_source(entry))
-        item = QTreeWidgetItem([entry.filename, str(score), label])
+    def _make_nif_item(self, entry, score, include_textures, provider=None, root=False):
+        label = provider.label if provider else self._provider_label(entry_source(entry))
+        status = match_label(score)
+        item = QTreeWidgetItem([status, entry.filename, "" if score is None else str(score), label])
         item.setData(0, Qt.ItemDataRole.UserRole, {
-            "type": "nif", "entry": entry,
-            "search": f"{entry.filename} {entry.relative_path} {label}",
+            "type": "mesh" if root else "nif", "entry": entry,
+            "search": f"{status} {entry.filename} {entry.relative_path} {label}",
         })
         item.setToolTip(0, self._entry_location(entry))
-        item.setToolTip(2, label)
+        item.setToolTip(3, label)
         if include_textures:
+            branch = QTreeWidgetItem(["", "Referenced Textures", str(len(entry.textures)), ""])
+            branch.setData(0, Qt.ItemDataRole.UserRole, {"type": "group"})
+            item.addChild(branch)
             for texture_path in entry.textures:
-                item.addChild(self._make_texture_item(texture_path, entry, results=True))
+                branch.addChild(self._make_texture_item(texture_path, entry, results=True))
         return item
 
-    def _show_dds_search_summary(
-        self,
-        query: str,
-        results: list,
-        high: list,
-        medium: list,
-        low: list,
-        total=None,
-    ) -> None:
-        self._add_detail("--- DDS -> NIF Search ---", "")
-        self._add_detail("Query", query)
-        self._add_detail("Matching NIFs", str(total if total is not None else len(results)))
-        if total is not None and total > len(results):
-            self._add_detail("Displayed NIFs", str(len(results)))
-        self._add_detail("Exact", str(len(high)))
-        self._add_detail("Partial", str(len(medium)))
-        self._add_detail("Possible", str(len(low)))
-        if results:
-            self._add_detail("Details", "Select a NIF to inspect referenced texture paths")
+    def _make_mesh_group(self, group, include_textures):
+        if group.winner:
+            version = group.winner
+            item = self._make_nif_item(version.entry, version.score, include_textures, version.provider, root=True)
         else:
-            self._add_detail("Details", "No indexed NIF references matched this query")
+            label = (f"{group.winner_origin} [Unindexed or unresolved winner]" if group.winner_origin
+                     else "No active winner")
+            item = QTreeWidgetItem(["Unavailable", group.virtual_path.rsplit("/", 1)[-1], "", label])
+            item.setData(0, Qt.ItemDataRole.UserRole, {
+                "type": "mesh", "entry": None, "path": group.virtual_path,
+                "search": f"{group.virtual_path} {label}", "warnings": group.warnings,
+                "winner_source": group.winner_source,
+            })
+            if group.winner_source:
+                item.setToolTip(3, group.winner_source.location_text)
+        item.setToolTip(0, f"Best version score: {group.best_score}. Parent score belongs to the profile winner.")
+        for version in group.versions:
+            if version is not group.winner:
+                item.addChild(self._make_nif_item(version.entry, version.score, include_textures, version.provider))
+        return item
+
+    def _show_search_summary(self, payload):
+        self._add_detail("Query", payload["query"])
+        self._add_detail("Matching Mesh Paths", str(payload["total"]))
+        if payload["total"] > len(payload["results"]):
+            self._add_detail("Displayed Mesh Paths", str(len(payload["results"])))
+        counts = payload.get("counts", {})
+        for label in ("Exact Match", "Close Match", "Partial Match"):
+            self._add_detail(f"Best {label}", str(counts.get(label, 0)))
+        self._add_detail("Scoring", "Counts and ranking use the best version; parent scores belong to winners.")
+        self._add_detail("Details", "Select a mesh version to inspect its referenced textures" if payload["results"]
+                         else "No indexed mesh versions matched this query")
 
     def _add_detail(self, key: str, value: str):
         item = QTreeWidgetItem([key, value])
@@ -745,17 +768,68 @@ class NifTextureSearchTab(QWidget):
         data = item.data(0, Qt.ItemDataRole.UserRole)
         if not data:
             return
+        self._details_generation += 1
+        for worker in self._texture_workers:
+            worker.cancel()
+        self._details_data = data
+        self._render_selected_details(data)
+        self._set_action_data(data)
+        entry = data.get("entry") or data.get("nif_entry")
+        paths = [data["path"]] if data.get("type") == "texture" else entry.textures if entry else []
+        if (self._snapshot and self._resolution_session and
+                any(not self._snapshot.texture_ready(path) for path in paths)):
+            worker = TextureResolutionWorker(self._resolution_session, paths, self._details_generation)
+            self._texture_workers.append(worker)
+            worker.ready.connect(self._on_texture_ready)
+            worker.failed.connect(self._on_texture_failed)
+            worker.finished.connect(lambda: self._release_texture_worker(worker))
+            worker.start()
 
+    def _render_selected_details(self, data):
         self._details_filter.reset()
         self._details_tree.clear()
         item_type = data.get("type")
 
-        if item_type == "nif":
-            self._show_nif_details(data["entry"])
+        if item_type in ("nif", "mesh"):
+            if data.get("entry"):
+                self._show_nif_details(data["entry"])
+            else:
+                self._add_detail("Path", data.get("path", ""))
+                self._add_detail("Status", "No indexed effective winner; select an installed version below this row.")
+                for warning in data.get("warnings", ()):
+                    self._add_detail("Resolution Warning", warning)
         elif item_type == "texture":
             self._show_texture_details(data)
         self._details_filter.apply()
-        self._set_action_data(data)
+
+    def _release_texture_worker(self, worker):
+        if worker in self._texture_workers:
+            self._texture_workers.remove(worker)
+        worker.deleteLater()
+
+    def _on_texture_ready(self, generation, resolved):
+        if generation != self._details_generation or not self._snapshot:
+            return
+        for path, (providers, warnings) in resolved.items():
+            self._snapshot.textures[path] = providers
+            self._snapshot.texture_warnings[path] = warnings
+        for item in self._results_filter.items():
+            data = item.data(0, Qt.ItemDataRole.UserRole) or {}
+            if data.get("type") == "texture" and self._snapshot.texture_ready(data["path"]):
+                status = "Found" if any(p.winning for p in self._snapshot.providers(data["path"])) else "Missing"
+                item.setText(0, status)
+                data["search"] = f"{data['path']} {status}"
+                item.setData(0, Qt.ItemDataRole.UserRole, data)
+        action_data = self._action_data
+        if self._details_data:
+            self._render_selected_details(self._details_data)
+        self._results_filter.apply()
+        self._set_action_data(action_data)
+
+    def _on_texture_failed(self, generation, message):
+        if generation == self._details_generation:
+            self._add_detail("Provider Resolution Error", message)
+            self.status_changed.emit(f"Texture provider resolution failed: {message}")
 
     def _show_nif_details(self, entry: NifTextureEntry) -> None:
         self._add_detail("File", entry.filename)
@@ -777,9 +851,10 @@ class NifTextureSearchTab(QWidget):
     def _make_texture_item(self, texture_path, entry, results=False):
         providers = self._snapshot.providers(texture_path) if self._snapshot else []
         found = any(provider.winning for provider in providers)
-        status = "Found" if found else "Missing"
+        ready = self._snapshot and self._snapshot.texture_ready(texture_path)
+        status = ("Found" if found else "Missing") if ready else "Loading"
         item = QTreeWidgetItem(
-            [texture_path, status, ""] if results else [status, texture_path]
+            [status, texture_path, "", ""] if results else [status, texture_path]
         )
         item.setData(0, Qt.ItemDataRole.UserRole, {
             "type": "texture", "path": texture_path, "nif_entry": entry,
@@ -787,6 +862,12 @@ class NifTextureSearchTab(QWidget):
         })
         item.setToolTip(0, texture_path)
         item.setToolTip(1, texture_path)
+        if not ready:
+            item.setToolTip(0, "Select this texture or its mesh to resolve current-profile providers.")
+        if self._snapshot:
+            warnings = self._snapshot.texture_warnings.get(self._snapshot.index.normalize_path(texture_path), ())
+            if warnings:
+                item.setToolTip(0, "\n".join(warnings))
         if not results:
             for provider in providers:
                 source = provider.source
@@ -851,7 +932,7 @@ class NifTextureSearchTab(QWidget):
             return None
         if data.get("type") == "provider":
             return data["source"]
-        if data.get("type") == "nif":
+        if data.get("type") in ("nif", "mesh") and data.get("entry"):
             return entry_source(data["entry"])
         if data.get("type") == "texture" and self._snapshot:
             return next((provider.source for provider in self._snapshot.providers(data["path"])
@@ -923,11 +1004,11 @@ class NifTextureSearchTab(QWidget):
             self._preview_result_data(self._action_data)
 
     def _preview_result_data(self, data: dict) -> None:
-        if data.get("type") not in ("nif", "texture", "provider"):
+        if data.get("type") not in ("nif", "mesh", "texture", "provider"):
             return
-        if data.get("type") == "nif":
+        if data.get("type") in ("nif", "mesh"):
             entry = data.get("entry")
-            if preview_nif_entry(self, entry, self._organizer) and entry:
+            if entry and preview_nif_entry(self, entry, self._organizer):
                 self.status_changed.emit(f"Preview: {entry.relative_path}")
             return
         source = self._action_source(data)
@@ -963,11 +1044,14 @@ class NifTextureSearchTab(QWidget):
             if item.isHidden():
                 return
             prefix = "  " * indent
-            text = item.text(0)
-            score = item.text(1)
-            mod = item.text(2)
+            status = item.text(0)
+            text = item.text(1)
+            score = item.text(2)
+            mod = item.text(3)
 
             line = f"{prefix}{text}"
+            if status:
+                line += f" [{status}]"
             if score:
                 line += f" [score: {score}]"
             if mod:

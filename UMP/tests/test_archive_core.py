@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 import zlib
+from unittest.mock import patch
 from pathlib import Path
 
 
@@ -168,6 +169,45 @@ class ArchiveCoreTests(unittest.TestCase):
         member = next(item for item in archive.members if item.virtual_path.endswith(".nif"))
 
         self.assertTrue(archive.extract(member).startswith(b"Gamebryo File Format"))
+
+    def test_index_inventory_traverses_once_and_archive_reads_use_direct_lookup(self):
+        root = self.root / "mod"
+        (root / "textures").mkdir(parents=True)
+        (root / "meshes").mkdir()
+        (root / "textures" / "loose.dds").write_bytes(b"dds")
+        (root / "meshes" / "loose.nif").write_bytes(b"nif")
+        _write_bsa(root / "One.bsa", 105, {"meshes/a.nif": b"one", "textures/a.dds": b"dds"})
+        _write_bsa(root / "Two.bsa", 104, {"meshes/b.nif": b"two"}, compress=True)
+        with patch.object(archive_core, "_iter_mod_roots", return_value=[]):
+            catalog = archive_core.AssetCatalog(object(), include_archives=True)
+        catalog.mod_roots = [("Mod", root)]
+        with patch.object(archive_core.os, "walk", wraps=os.walk) as walk:
+            catalog.prepare_index_inventory()
+            scope = archive_core.build_index_scope(object(), True, False, catalog)
+            assets = list(catalog.iter_index_assets())
+            self.assertEqual(walk.call_count, 1)
+        self.assertEqual(len(scope["archive_fingerprints"]), 2)
+        self.assertEqual(len(assets), 5)
+        nif = next(asset.source() for asset in assets if asset.virtual_path == "meshes/b.nif")
+        with patch.object(Path, "resolve", side_effect=AssertionError("per-read path resolution")):
+            self.assertEqual(catalog.read_bytes(nif), b"two")
+            self.assertEqual(catalog.read_bytes(nif), b"two")
+        catalog.close()
+
+    def test_inventory_cancellation_and_corrupt_archive_continue(self):
+        root = self.root / "mod"
+        root.mkdir()
+        (root / "Broken.bsa").write_bytes(b"BSA\x00")
+        _write_bsa(root / "Good.bsa", 105, {"meshes/good.nif": b"nif"})
+        with patch.object(archive_core, "_iter_mod_roots", return_value=[]):
+            catalog = archive_core.AssetCatalog(object(), include_archives=True)
+        catalog.mod_roots = [("Mod", root)]
+        self.assertEqual(list(catalog.iter_index_assets(lambda: True)), [])
+        self.assertIsNone(catalog._index_inventory)
+        assets = list(catalog.iter_index_assets())
+        self.assertEqual([asset.virtual_path for asset in assets], ["meshes/good.nif"])
+        self.assertTrue(any("Broken.bsa" in error for error in catalog.errors))
+        catalog.close()
 
 
 if __name__ == "__main__":

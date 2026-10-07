@@ -63,6 +63,26 @@ class BsaMember:
 
 
 @dataclass(frozen=True)
+class InventoryAsset:
+    owner: str
+    virtual_path: str
+    container_path: str
+    is_game: bool
+    source_kind: str = "loose"
+    mtime: float = 0.0
+
+    def source(self) -> AssetSource:
+        archived = self.source_kind == "bsa"
+        return AssetSource(
+            self.owner, self.virtual_path, self.source_kind, self.container_path,
+            physical_path="" if archived else self.container_path,
+            archive_name=Path(self.container_path).name if archived else "",
+            is_game=self.is_game,
+            mtime=self.mtime if archived else Path(self.container_path).stat().st_mtime,
+        )
+
+
+@dataclass(frozen=True)
 class BsaIndex:
     path: Path
     version: int
@@ -450,6 +470,69 @@ class AssetCatalog:
         self.errors: list[str] = []
         self._archive_containers: Optional[list[tuple[str, bool, Path]]] = None
         self._archive_sources: Optional[list[tuple[str, bool, BsaArchive]]] = None
+        self._archives_by_path: dict[str, BsaArchive] = {}
+        self._index_inventory = None
+
+    def prepare_index_inventory(self, cancelled=lambda: False):
+        """Collect compact loose records and containers in one directory traversal."""
+        if self._index_inventory is not None:
+            return
+        records, containers = [], []
+        seen = set()
+
+        def archive(owner, is_game, path):
+            key = os.path.normcase(os.path.abspath(path))
+            if key not in seen and os.path.splitext(path)[1].lower() == ".bsa" and os.path.isfile(path):
+                seen.add(key)
+                containers.append((owner, is_game, Path(path)))
+
+        roots = list(self.mod_roots)
+        if self.game_data_root is not None:
+            roots.append((GAME_DATA_OWNER, self.game_data_root))
+        for owner, root in roots:
+            is_game = owner == GAME_DATA_OWNER
+            for current, _dirs, files in os.walk(root, onerror=lambda exc: self.errors.append(str(exc))):
+                if cancelled():
+                    return
+                for name in files:
+                    ext = os.path.splitext(name)[1].lower()
+                    full_path = os.path.join(current, name)
+                    if ext == ".bsa" and self.include_archives:
+                        archive(owner, is_game, full_path)
+                    elif ext in (".nif", ".dds"):
+                        virtual = normalize_virtual_path(os.path.relpath(full_path, root))
+                        records.append((owner, virtual, full_path, is_game))
+        if self.include_archives and self.game_data_root is not None:
+            for name in _feature_archive_names(self.organizer):
+                path = Path(name)
+                archive(GAME_DATA_OWNER, True, str(path if path.is_absolute() else self.game_data_root / path))
+        self._index_inventory = records
+        if self.include_archives:
+            self._archive_containers = containers
+
+    def iter_index_assets(self, cancelled=lambda: False):
+        self.prepare_index_inventory(cancelled)
+        for record in self._index_inventory or ():
+            if cancelled():
+                return
+            yield InventoryAsset(*record)
+        if self.include_archives:
+            for owner, is_game, archive in self.archives:
+                mtime = archive.path.stat().st_mtime
+                container = str(archive.path)
+                for member in archive.members:
+                    if cancelled():
+                        return
+                    if member.virtual_path.endswith((".nif", ".dds")):
+                        yield InventoryAsset(owner, member.virtual_path, container, is_game, "bsa", mtime)
+
+    def index_nif_count(self):
+        self.prepare_index_inventory()
+        count = sum(record[1].endswith(".nif") for record in self._index_inventory or ())
+        if self.include_archives:
+            count += sum(member.virtual_path.endswith(".nif")
+                         for _owner, _is_game, archive in self.archives for member in archive.members)
+        return count
 
     def _discover_archive_containers(self) -> list[tuple[str, bool, Path]]:
         if not self.include_archives:
@@ -503,6 +586,7 @@ class AssetCatalog:
                 self.errors.append(f"{path.name}: {exc}")
                 continue
             archives.append((owner, is_game, archive))
+            self._archives_by_path[os.path.normcase(os.path.abspath(archive.path))] = archive
         return archives
 
     @property
@@ -620,12 +704,12 @@ class AssetCatalog:
     def read_bytes(self, source: AssetSource) -> bytes:
         if source.source_kind == "loose":
             return Path(source.physical_path).read_bytes()
-        archive_path = str(Path(source.container_path).resolve()).lower()
-        for _owner, _is_game, archive in self.archives:
-            if str(archive.path.resolve()).lower() == archive_path:
-                member = archive.find_member(source.virtual_path)
-                if member is None:
-                    break
+        self.archives
+        archive_path = os.path.normcase(os.path.abspath(source.container_path))
+        archive = self._archives_by_path.get(archive_path)
+        if archive is not None:
+            member = archive.find_member(source.virtual_path)
+            if member is not None:
                 return archive.extract(member)
         raise FileNotFoundError(source.location_text)
 
@@ -636,9 +720,9 @@ class AssetCatalog:
             archive.close()
 
 
-def build_index_scope(organizer, include_archives: bool, only_active: bool) -> dict:
+def build_index_scope(organizer, include_archives: bool, only_active: bool, catalog=None) -> dict:
     exhaustive = bool(include_archives)
-    catalog = AssetCatalog(
+    catalog = catalog or AssetCatalog(
         organizer,
         include_archives=include_archives,
         exhaustive=exhaustive,

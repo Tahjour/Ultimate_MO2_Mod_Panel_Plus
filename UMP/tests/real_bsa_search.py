@@ -49,10 +49,20 @@ def main():
                     organizer.infos[texture_path] = SimpleNamespace(
                         filePath=str(path.parent / texture_path), archive=path.name, origins=["data"]
                     )
-            snapshot = search.ProfileResolver(organizer).snapshot(index)
-            found = [path for path in textures if any(p.winning for p in snapshot.providers(path))]
+            session = search.ResolutionSession(organizer, index)
+            assert session.acquire(lambda: False)
+            try:
+                providers = session.texture_providers(textures, lambda: False)
+            finally:
+                session.lock.release()
+            found = [path for path in textures if any(p.winning for p in providers[index.normalize_path(path)][0])]
             assert found, "No real archive-backed DDS providers resolved"
-            assert snapshot.index.find_nifs_by_texture(found[0])[0][0].is_game
+            worker = search.NifSearchWorker(organizer, index, found[0], False, 1, session)
+            from test_nif_core import _CaptureSignal
+            worker.ready, worker.failed = _CaptureSignal(), _CaptureSignal()
+            worker.run()
+            assert not worker.failed.calls, worker.failed.calls
+            assert worker.ready.calls[0][1]["results"][0].winner.entry.is_game
             print(f"Real BSA search passed: {member.virtual_path}; {len(found)}/{len(textures)} DDS references resolved")
     finally:
         mesh_archive.close()

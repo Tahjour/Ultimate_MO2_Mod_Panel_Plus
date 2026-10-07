@@ -5,10 +5,37 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 from dataclasses import dataclass, field
+import time
+import os
+import tempfile
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from .archive_core import AssetCatalog, AssetSource, build_index_scope
+
+
+class _JsonArray(list):
+    """Let json.dump stream values without duplicating the complete index graph."""
+
+    def __init__(self, count, values):
+        self.count, self.values = count, values
+
+    def __bool__(self):
+        return bool(self.count)
+
+    def __iter__(self):
+        return iter(self.values())
+
+
+class _JsonObject(dict):
+    def __init__(self, count, items):
+        self.count, self.values = count, items
+
+    def __bool__(self):
+        return bool(self.count)
+
+    def items(self):
+        return self.values()
 
 
 @dataclass
@@ -202,6 +229,10 @@ class NifTextureIndex:
         self._texture_filename_cache: dict[str, set[str]] = {}
 
         self._texture_providers: dict[str, list[AssetSource]] = {}
+        self._mesh_paths: dict[str, list[NifTextureEntry]] = {}
+        self._mesh_fields: dict[str, tuple[str, str, str]] = {}
+        self._texture_fields: dict[str, tuple[str, str, str]] = {}
+        self._entry_paths: dict[str, str] = {}
 
         self._is_loaded = False
         self._is_dirty = False
@@ -299,17 +330,21 @@ class NifTextureIndex:
         except Exception:
             return False
 
-    def save_to_cache(self) -> bool:
+    def save_to_cache(self, cancelled=lambda: False) -> bool:
         if not self._is_dirty:
             return True
 
+        temporary_path = None
         try:
             self._cache_dir.mkdir(parents=True, exist_ok=True)
 
-            entries = []
-            for entry in self._nif_entries.values():
-                entries.append(
-                    {
+            def entries():
+                for number, entry in enumerate(self._nif_entries.values()):
+                    if number % 500 == 0:
+                        if cancelled():
+                            raise InterruptedError("Index cache save cancelled")
+                        time.sleep(0)
+                    yield {
                         "mod": entry.mod_name,
                         "path": entry.relative_path,
                         "textures": entry.textures,
@@ -319,14 +354,13 @@ class NifTextureIndex:
                         "is_game": entry.is_game,
                         "parse_error": entry.parse_error,
                     }
-                )
 
             data = {
                 "version": self.CACHE_VERSION,
                 "scope": self._scope,
-                "entries": entries,
-                "texture_providers": {
-                    path: [
+                "entries": _JsonArray(len(self._nif_entries), entries),
+                "texture_providers": _JsonObject(len(self._texture_providers), lambda: (
+                    (path, [
                         {
                             "owner": source.owner,
                             "path": source.virtual_path,
@@ -338,19 +372,31 @@ class NifTextureIndex:
                             "mtime": source.mtime,
                         }
                         for source in providers
-                    ]
+                    ])
                     for path, providers in self._texture_providers.items()
-                },
+                )),
             }
 
-            with open(self._cache_file, "w", encoding="utf-8") as f:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=self._cache_dir,
+                                             prefix="nif-index-", suffix=".tmp", delete=False) as f:
+                temporary_path = Path(f.name)
                 json.dump(data, f, ensure_ascii=False)
+            if cancelled():
+                raise InterruptedError("Index cache save cancelled")
+            os.replace(temporary_path, self._cache_file)
+            temporary_path = None
 
             self._is_dirty = False
             return True
 
         except Exception:
             return False
+        finally:
+            if temporary_path is not None:
+                try:
+                    temporary_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     def _add_entry(self, entry: NifTextureEntry) -> None:
         key = entry.key
@@ -358,9 +404,21 @@ class NifTextureIndex:
         if previous is not None:
             self._remove_entry_links(key, previous)
         self._nif_entries[key] = entry
+        path = entry.relative_path.lower().replace("\\", "/").strip("/")
+        self._entry_paths[key] = path
+        versions = self._mesh_paths.setdefault(path, [])
+        if previous is not None:
+            versions.remove(previous)
+        versions.append(entry)
+        filename = path.rsplit("/", 1)[-1]
+        self._mesh_fields[path] = (filename, filename.removesuffix(".nif"), path)
 
         for tex in entry.textures:
             normalized = self.normalize_path(tex)
+            filename = normalized.rsplit("/", 1)[-1]
+            self._texture_fields[normalized] = (
+                self.remove_extension(normalized), filename, self.remove_extension(filename)
+            )
 
             if normalized not in self._texture_to_nifs:
                 self._texture_to_nifs[normalized] = set()
@@ -385,6 +443,7 @@ class NifTextureIndex:
             keys.discard(key)
             if not keys:
                 self._texture_to_nifs.pop(normalized, None)
+                self._texture_fields.pop(normalized, None)
                 removed_paths.add(normalized)
         if removed_paths:
             for filename, paths in list(self._texture_filename_cache.items()):
@@ -447,6 +506,10 @@ class NifTextureIndex:
     def entries(self) -> list[NifTextureEntry]:
         return list(self._nif_entries.values())
 
+    def mesh_versions(self, virtual_path: str) -> list[NifTextureEntry]:
+        path = virtual_path.lower().replace("\\", "/").strip("/")
+        return self._mesh_paths.get(path, [])
+
     def _add_texture_provider(self, texture_path: str, source: AssetSource) -> None:
         normalized = self.normalize_path(texture_path)
         providers = self._texture_providers.setdefault(normalized, [])
@@ -479,11 +542,11 @@ class NifTextureIndex:
         self._is_loaded = True
         self._is_dirty = True
 
-    def find_nifs_by_texture(
+    def score_texture_query(
         self,
         texture_query: str,
-        limit: Optional[int] = 500,
-    ) -> list[tuple[NifTextureEntry, int]]:
+        cancelled=lambda: False,
+    ) -> dict[str, int]:
         query = self.normalize_path(texture_query)
         query_no_ext = self.remove_extension(query)
         query_filename = self.get_filename(query)
@@ -491,10 +554,12 @@ class NifTextureIndex:
 
         candidates: dict[str, int] = {}
 
-        for tex_path, nif_keys in self._texture_to_nifs.items():
-            tex_no_ext = self.remove_extension(tex_path)
-            tex_filename = self.get_filename(tex_path)
-            tex_filename_no_ext = self.remove_extension(tex_filename)
+        for number, (tex_path, nif_keys) in enumerate(self._texture_to_nifs.items()):
+            if number % 1024 == 0:
+                if cancelled():
+                    return {}
+                time.sleep(0)
+            tex_no_ext, tex_filename, tex_filename_no_ext = self._texture_fields[tex_path]
 
             score = 0
 
@@ -532,32 +597,34 @@ class NifTextureIndex:
                             for nif_key in self._texture_to_nifs[tex_path]:
                                 candidates[nif_key] = 15
 
-        results = []
-        for nif_key, score in candidates.items():
-            if nif_key in self._nif_entries:
-                results.append((self._nif_entries[nif_key], score))
+        return candidates
 
+    def find_nifs_by_texture(self, texture_query, limit=500, cancelled=lambda: False):
+        candidates = self.score_texture_query(texture_query, cancelled)
+        results = [(self._nif_entries[key], score) for key, score in candidates.items()]
         results.sort(key=lambda x: -x[1])
         return results[:limit]
 
-    def find_textures_by_nif(
+    def score_mesh_query(
         self,
         nif_query: str,
-        limit: Optional[int] = 100,
-    ) -> list[tuple[NifTextureEntry, int]]:
-        query = nif_query.lower().strip()
+        cancelled=lambda: False,
+    ) -> dict[str, int]:
+        query = nif_query.lower().replace("\\", "/").strip().strip("/")
         query_no_ext = query.removesuffix(".nif")
 
-        results = []
+        scores = {}
 
-        for entry in self._nif_entries.values():
-            filename_lower = entry.filename.lower()
-            path_lower = entry.relative_path.lower()
-            filename_no_ext = filename_lower.removesuffix(".nif")
+        for number, (path, versions) in enumerate(self._mesh_paths.items()):
+            if number % 1024 == 0:
+                if cancelled():
+                    return {}
+                time.sleep(0)
+            filename_lower, filename_no_ext, path_lower = self._mesh_fields[path]
 
             score = 0
 
-            if query == filename_lower:
+            if query == path_lower or query == filename_lower:
                 score = 100
             elif query_no_ext == filename_no_ext:
                 score = 95
@@ -573,16 +640,38 @@ class NifTextureIndex:
                 score = 40
 
             if score > 0:
-                results.append((entry, score))
+                for entry in versions:
+                    scores[entry.key] = score
 
+        return scores
+
+    def find_textures_by_nif(self, nif_query, limit=100, cancelled=lambda: False):
+        candidates = self.score_mesh_query(nif_query, cancelled)
+        results = [(self._nif_entries[key], score) for key, score in candidates.items()]
         results.sort(key=lambda x: -x[1])
         return results[:limit]
+
+    def matching_groups(self, query, nif_to_dds, cancelled=lambda: False):
+        scores = self.score_mesh_query(query, cancelled) if nif_to_dds else self.score_texture_query(query, cancelled)
+        best = {}
+        for number, (key, score) in enumerate(scores.items()):
+            if number % 2048 == 0:
+                if cancelled():
+                    return {}, {}
+                time.sleep(0)
+            path = self._entry_paths[key]
+            best[path] = max(best.get(path, 0), score)
+        return scores, best
 
     def clear(self) -> None:
         self._nif_entries.clear()
         self._texture_to_nifs.clear()
         self._texture_filename_cache.clear()
         self._texture_providers.clear()
+        self._mesh_paths.clear()
+        self._mesh_fields.clear()
+        self._texture_fields.clear()
+        self._entry_paths.clear()
         self.normalize_path.cache_clear()
         self._is_loaded = False
         self._is_dirty = False
@@ -593,7 +682,14 @@ class NifTextureIndex:
         for key in keys_to_remove:
             entry = self._nif_entries.pop(key, None)
             if entry:
+                self._entry_paths.pop(key, None)
                 self._remove_entry_links(key, entry)
+                path = entry.relative_path.lower().replace("\\", "/").strip("/")
+                versions = self._mesh_paths[path]
+                versions.remove(entry)
+                if not versions:
+                    self._mesh_paths.pop(path)
+                    self._mesh_fields.pop(path)
 
         self._is_dirty = True
 
@@ -633,13 +729,28 @@ class NifIndexWorker(QThread):
 
         try:
             self.phase.emit("Validating index cache...")
+            catalog = AssetCatalog(
+                self._organizer,
+                include_archives=self._include_archives,
+                exhaustive=self._include_archives,
+                active_only=self._only_active,
+            )
+            if self._include_archives:
+                catalog.prepare_index_inventory(lambda: self._cancelled)
+            if self._cancelled:
+                self.completed.emit(0, 0)
+                return
             scope = build_index_scope(
                 self._organizer,
                 self._include_archives,
                 self._only_active,
+                catalog,
             )
             working_index.set_scope(scope)
             if self._incremental and working_index.load_from_cache(scope):
+                if self._cancelled:
+                    self.completed.emit(0, 0)
+                    return
                 self.index_ready.emit(working_index, True)
                 self.completed.emit(working_index.nif_count, working_index.texture_count)
                 return
@@ -648,39 +759,27 @@ class NifIndexWorker(QThread):
             working_index.set_scope(scope)
 
             self.phase.emit("Scanning NIF files...")
-            catalog = AssetCatalog(
-                self._organizer,
-                include_archives=self._include_archives,
-                exhaustive=self._include_archives,
-                active_only=self._only_active,
-            )
-            nif_files = list(
-                catalog.iter_sources(
-                    [".nif"],
-                    include_archive_members=self._include_archives,
-                    cancelled=lambda: self._cancelled,
-                )
-            )
-            for message in catalog.errors:
-                self.warning.emit(message)
-            if self._cancelled:
-                self.completed.emit(0, 0)
-                return
-
-            total = len(nif_files)
+            texture_records = []
+            total = catalog.index_nif_count() if hasattr(catalog, "index_nif_count") else 0
             processed = 0
             reported_archive_errors: set[tuple[str, str]] = set()
 
-            for source in nif_files:
+            for record in catalog.iter_index_assets(lambda: self._cancelled):
                 if self._cancelled:
                     self.completed.emit(0, 0)
                     return
+                if not record.virtual_path.endswith(".nif"):
+                    texture_records.append(record)
+                    continue
 
                 processed += 1
                 if processed == 1 or processed % 100 == 0 or processed == total:
-                    self.progress.emit(processed, total, source.filename)
+                    self.progress.emit(processed, total, record.virtual_path.rsplit("/", 1)[-1])
+                    time.sleep(0)
 
+                source = None
                 try:
+                    source = record.source()
                     parser = LightweightNifParser()
                     data = catalog.read_bytes(source)
                     if not data.startswith((b"Gamebryo File Format", b"NetImmerse File Format")):
@@ -699,6 +798,9 @@ class NifIndexWorker(QThread):
                         )
                     )
                 except Exception as exc:
+                    if source is None:
+                        source = AssetSource(record.owner, record.virtual_path, record.source_kind,
+                                             record.container_path, is_game=record.is_game, mtime=record.mtime)
                     working_index.add_entry(NifTextureEntry(
                         mod_name=source.owner,
                         relative_path=source.virtual_path,
@@ -714,25 +816,26 @@ class NifIndexWorker(QThread):
                             reported_archive_errors.add(key)
                             self.warning.emit(f"{source.archive_name}: {exc}")
 
+            for message in catalog.errors:
+                self.warning.emit(message)
+
             if self._cancelled:
                 self.completed.emit(0, 0)
                 return
 
             referenced = working_index.referenced_texture_paths()
             self.phase.emit("Mapping texture providers...")
-            texture_sources = catalog.iter_sources(
-                [".dds"],
-                include_archive_members=self._include_archives,
-                cancelled=lambda: self._cancelled,
-            )
             texture_count = 0
-            for source in texture_sources:
+            for record in texture_records:
                 if self._cancelled:
                     self.completed.emit(0, 0)
                     return
-                normalized = working_index.normalize_path(source.virtual_path)
+                normalized = working_index.normalize_path(record.virtual_path)
                 if normalized in referenced:
-                    working_index.add_texture_provider(normalized, source)
+                    try:
+                        working_index.add_texture_provider(normalized, record.source())
+                    except OSError as exc:
+                        self.warning.emit(f"{record.virtual_path}: {exc}")
                 texture_count += 1
                 if texture_count == 1 or texture_count % 1000 == 0:
                     self.progress.emit(texture_count, 0, "texture providers")
@@ -742,8 +845,11 @@ class NifIndexWorker(QThread):
                 return
             working_index.mark_build_complete()
             self.phase.emit("Saving index cache...")
-            if not working_index.save_to_cache():
+            if not working_index.save_to_cache(lambda: self._cancelled) and not self._cancelled:
                 self.warning.emit("Could not save the NIF texture index cache")
+            if self._cancelled:
+                self.completed.emit(0, 0)
+                return
             self.index_ready.emit(working_index, False)
             self.completed.emit(working_index.nif_count, working_index.texture_count)
         except Exception as exc:

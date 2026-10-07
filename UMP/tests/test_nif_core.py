@@ -161,11 +161,12 @@ class NifCoreTests(unittest.TestCase):
                 self.closed = False
                 FakeCatalog.instances.append(self)
 
-            def iter_sources(self, extensions, **_kwargs):
-                if extensions == [".nif"]:
-                    yield nif_source
-                else:
-                    yield from texture_sources
+            def prepare_index_inventory(self, _cancelled):
+                pass
+
+            def iter_index_assets(self, _cancelled):
+                for source in [nif_source] + texture_sources:
+                    yield types.SimpleNamespace(**source.__dict__, source=lambda source=source: source)
 
             def read_bytes(self, _source):
                 return b"Gamebryo File Format\ntextures/demo/item.dds\x00"

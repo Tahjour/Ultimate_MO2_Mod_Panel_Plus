@@ -54,7 +54,7 @@ class AssetTreeFilter:
             nonlocal visible, total
             data = item.data(0, Qt.ItemDataRole.UserRole) or {}
             kind = data.get("type")
-            searchable = kind in ("nif", "texture", "provider")
+            searchable = kind in ("mesh", "nif", "texture", "provider")
             own_text = data.get("search", " ".join(item.text(i) for i in range(item.columnCount())))
             text = f"{context} {own_text}".casefold()
             matched = searchable and all(term in text for term in terms)
@@ -83,7 +83,7 @@ class AssetTreeFilter:
                 self.tree.clearSelection()
         finally:
             self.tree.setUpdatesEnabled(True)
-        noun = "NIFs" if self.counted_type == "nif" else "referenced textures"
+        noun = "mesh paths" if self.counted_type == "mesh" else "NIFs" if self.counted_type == "nif" else "referenced textures"
         message = f"{visible}/{total} {noun}" if terms else f"{total} {noun}"
         if terms and not visible:
             message += " - no filter matches"
