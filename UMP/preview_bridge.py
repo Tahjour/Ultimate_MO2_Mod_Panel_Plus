@@ -26,12 +26,12 @@ def can_preview_virtual_path(path: str) -> bool:
     return Path(path or "").suffix.lower() in PREVIEW_EXTENSIONS
 
 
-def preview_asset_source(parent: QWidget, source: AssetSource, organizer=None) -> bool:
+def preview_asset_source(parent: QWidget, source: AssetSource, organizer=None, *, exact_source=False) -> bool:
     if source is None or not can_preview_virtual_path(source.virtual_path):
         QMessageBox.information(parent, "Preview", "Only DDS and NIF files can be previewed here.")
         return False
 
-    if _try_organizer_preview(parent, organizer, source):
+    if not exact_source and _try_organizer_preview(parent, organizer, source):
         return True
 
     data = b""

@@ -33,8 +33,8 @@ class FollowupStaticTests(unittest.TestCase):
         self.assertNotIn("def _check_texture_exists", source)
         self.assertNotIn("AssetCatalog", source)
         self.assertIn('"Texture Count"', source)
-        self.assertIn('"--- Texture Paths ---"', source)
-        self.assertIn("find_texture_providers", source)
+        self.assertIn('"Referenced Textures"', source)
+        self.assertIn("self._snapshot.providers", source)
 
     def test_worker_owns_scope_and_provider_catalog_work(self) -> None:
         tab_source = _read("UMP/tabs_nif.py")

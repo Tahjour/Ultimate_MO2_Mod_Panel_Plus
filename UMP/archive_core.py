@@ -647,6 +647,7 @@ def build_index_scope(organizer, include_archives: bool, only_active: bool) -> d
     return {
         "include_archives": bool(include_archives),
         "only_active": bool(only_active and not exhaustive),
+        "mod_roots": [[owner, str(root)] for owner, root in catalog.mod_roots],
         "archive_fingerprints": catalog.archive_fingerprints(),
     }
 

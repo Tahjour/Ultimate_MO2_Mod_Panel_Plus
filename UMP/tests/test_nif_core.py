@@ -195,7 +195,7 @@ class NifCoreTests(unittest.TestCase):
                 worker.phase = _CaptureSignal()
                 worker.progress = _CaptureSignal()
                 worker.index_ready = _CaptureSignal()
-                worker.finished = _CaptureSignal()
+                worker.completed = _CaptureSignal()
                 worker.error = _CaptureSignal()
                 worker.warning = _CaptureSignal()
 

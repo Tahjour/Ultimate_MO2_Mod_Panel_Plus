@@ -20,6 +20,7 @@ class NifTextureEntry:
     source_kind: str = "loose"
     container_path: str = ""
     is_game: bool = False
+    parse_error: str = ""
 
     @property
     def key(self) -> str:
@@ -186,7 +187,7 @@ class LightweightNifParser:
 
 
 class NifTextureIndex:
-    CACHE_VERSION = 4
+    CACHE_VERSION = 5
     PATH_CLEANUP_RE = re.compile(r"^(?:\.?/?(?:data|textures|meshes)/?)+", re.IGNORECASE)
     MULTI_SLASH_RE = re.compile(r"/+")
 
@@ -271,6 +272,7 @@ class NifTextureIndex:
                     source_kind=entry_data.get("source_kind", "loose"),
                     container_path=entry_data.get("container_path", ""),
                     is_game=entry_data.get("is_game", False),
+                    parse_error=entry_data.get("parse_error", ""),
                 )
                 self._add_entry(entry)
 
@@ -315,6 +317,7 @@ class NifTextureIndex:
                         "source_kind": entry.source_kind,
                         "container_path": entry.container_path,
                         "is_game": entry.is_game,
+                        "parse_error": entry.parse_error,
                     }
                 )
 
@@ -441,6 +444,9 @@ class NifTextureIndex:
     def referenced_texture_paths(self) -> set[str]:
         return set(self._texture_to_nifs)
 
+    def entries(self) -> list[NifTextureEntry]:
+        return list(self._nif_entries.values())
+
     def _add_texture_provider(self, texture_path: str, source: AssetSource) -> None:
         normalized = self.normalize_path(texture_path)
         providers = self._texture_providers.setdefault(normalized, [])
@@ -476,7 +482,7 @@ class NifTextureIndex:
     def find_nifs_by_texture(
         self,
         texture_query: str,
-        limit: int = 500,
+        limit: Optional[int] = 500,
     ) -> list[tuple[NifTextureEntry, int]]:
         query = self.normalize_path(texture_query)
         query_no_ext = self.remove_extension(query)
@@ -537,7 +543,7 @@ class NifTextureIndex:
     def find_textures_by_nif(
         self,
         nif_query: str,
-        limit: int = 100,
+        limit: Optional[int] = 100,
     ) -> list[tuple[NifTextureEntry, int]]:
         query = nif_query.lower().strip()
         query_no_ext = query.removesuffix(".nif")
@@ -597,7 +603,7 @@ class NifIndexWorker(QThread):
     phase = pyqtSignal(str)
     progress = pyqtSignal(int, int, str)
     index_ready = pyqtSignal(object, bool)
-    finished = pyqtSignal(int, int)
+    completed = pyqtSignal(int, int)
     error = pyqtSignal(str)
     warning = pyqtSignal(str)
 
@@ -622,7 +628,6 @@ class NifIndexWorker(QThread):
 
     def run(self) -> None:
         self.started.emit()
-        self._cancelled = False
         catalog: Optional[AssetCatalog] = None
         working_index = NifTextureIndex(self._index.cache_dir)
 
@@ -636,8 +641,11 @@ class NifIndexWorker(QThread):
             working_index.set_scope(scope)
             if self._incremental and working_index.load_from_cache(scope):
                 self.index_ready.emit(working_index, True)
-                self.finished.emit(working_index.nif_count, working_index.texture_count)
+                self.completed.emit(working_index.nif_count, working_index.texture_count)
                 return
+
+            working_index.clear()
+            working_index.set_scope(scope)
 
             self.phase.emit("Scanning NIF files...")
             catalog = AssetCatalog(
@@ -656,7 +664,7 @@ class NifIndexWorker(QThread):
             for message in catalog.errors:
                 self.warning.emit(message)
             if self._cancelled:
-                self.finished.emit(0, 0)
+                self.completed.emit(0, 0)
                 return
 
             total = len(nif_files)
@@ -665,29 +673,41 @@ class NifIndexWorker(QThread):
 
             for source in nif_files:
                 if self._cancelled:
-                    self.finished.emit(0, 0)
+                    self.completed.emit(0, 0)
                     return
 
                 processed += 1
-                self.progress.emit(processed, total, source.filename)
+                if processed == 1 or processed % 100 == 0 or processed == total:
+                    self.progress.emit(processed, total, source.filename)
 
                 try:
                     parser = LightweightNifParser()
-                    textures = parser.parse_bytes(catalog.read_bytes(source))
+                    data = catalog.read_bytes(source)
+                    if not data.startswith((b"Gamebryo File Format", b"NetImmerse File Format")):
+                        raise ValueError("Invalid NIF header")
+                    textures = parser.parse_bytes(data)
 
-                    if textures:
-                        working_index.add_entry(
-                            NifTextureEntry(
-                                mod_name=source.owner,
-                                relative_path=source.virtual_path,
-                                textures=textures,
-                                file_mtime=source.mtime,
-                                source_kind=source.source_kind,
-                                container_path=source.container_path,
-                                is_game=source.is_game,
-                            )
+                    working_index.add_entry(
+                        NifTextureEntry(
+                            mod_name=source.owner,
+                            relative_path=source.virtual_path,
+                            textures=textures,
+                            file_mtime=source.mtime,
+                            source_kind=source.source_kind,
+                            container_path=source.container_path,
+                            is_game=source.is_game,
                         )
+                    )
                 except Exception as exc:
+                    working_index.add_entry(NifTextureEntry(
+                        mod_name=source.owner,
+                        relative_path=source.virtual_path,
+                        file_mtime=source.mtime,
+                        source_kind=source.source_kind,
+                        container_path=source.container_path,
+                        is_game=source.is_game,
+                        parse_error=str(exc),
+                    ))
                     if source.source_kind == "bsa":
                         key = (source.container_path, str(exc))
                         if key not in reported_archive_errors:
@@ -695,7 +715,7 @@ class NifIndexWorker(QThread):
                             self.warning.emit(f"{source.archive_name}: {exc}")
 
             if self._cancelled:
-                self.finished.emit(0, 0)
+                self.completed.emit(0, 0)
                 return
 
             referenced = working_index.referenced_texture_paths()
@@ -708,7 +728,7 @@ class NifIndexWorker(QThread):
             texture_count = 0
             for source in texture_sources:
                 if self._cancelled:
-                    self.finished.emit(0, 0)
+                    self.completed.emit(0, 0)
                     return
                 normalized = working_index.normalize_path(source.virtual_path)
                 if normalized in referenced:
@@ -717,12 +737,15 @@ class NifIndexWorker(QThread):
                 if texture_count == 1 or texture_count % 1000 == 0:
                     self.progress.emit(texture_count, 0, "texture providers")
 
+            if self._cancelled:
+                self.completed.emit(0, 0)
+                return
             working_index.mark_build_complete()
             self.phase.emit("Saving index cache...")
             if not working_index.save_to_cache():
                 self.warning.emit("Could not save the NIF texture index cache")
             self.index_ready.emit(working_index, False)
-            self.finished.emit(working_index.nif_count, working_index.texture_count)
+            self.completed.emit(working_index.nif_count, working_index.texture_count)
         except Exception as exc:
             self.error.emit(str(exc))
         finally:

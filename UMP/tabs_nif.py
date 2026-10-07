@@ -2,7 +2,6 @@ import os
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QSettings, QTimer, pyqtSignal
-from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -26,6 +25,8 @@ from PyQt6.QtWidgets import (
 
 from .nif_core import NifTextureEntry, NifTextureIndex, NifIndexWorker
 from .archive_core import AssetSource
+from .nif_search import NifSearchWorker, entry_source
+from .nif_tree_filter import AssetTreeFilter
 from .preview_bridge import can_preview_virtual_path, preview_asset_source, preview_nif_entry
 
 
@@ -55,11 +56,20 @@ class NifTextureSearchTab(QWidget):
         self._is_indexing = False
         self._pending_scope_rebuild = False
         self._pending_external_texture_query = ""
+        self._search_generation = 0
+        self._search_workers = []
+        self._index_workers = []
+        self._snapshot = None
+        self._action_data = None
+
+        self._last_query = ""
+        self._profile_index_dirty = False
 
         self.settings = QSettings("ModOrganizer2", "FullModSearchPlugin")
 
         self._setup_ui()
         self._connect_signals()
+        self._subscribe_profile_changes()
 
     def _setup_ui(self) -> None:
         layout = QVBoxLayout(self)
@@ -144,20 +154,23 @@ class NifTextureSearchTab(QWidget):
         results_layout = QVBoxLayout(results_group)
         results_layout.setContentsMargins(4, 2, 4, 2)
         results_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self._results_filter_input, result_expand, result_collapse = self._filter_controls(
+            results_layout, "Filter results (all words or quoted phrases)..."
+        )
 
         self._results_tree = QTreeWidget()
-        self._results_tree.setHeaderLabels(["Item", "Score", "Details"])
+        self._results_tree.setHeaderLabels(["Item", "Score", "Winning Mod"])
         self._results_tree.setAlternatingRowColors(True)
         self._results_tree.setRootIsDecorated(True)
         self._results_tree.setIndentation(16)
-        self._set_rows_height(self._results_tree, 20)
+        self._results_tree.setUniformRowHeights(True)
 
         header = self._results_tree.header()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
         self._results_tree.setColumnWidth(1, 50)
-        self._results_tree.setColumnWidth(2, 120)
+        self._results_tree.setColumnWidth(2, 260)
 
         results_layout.addWidget(self._results_tree)
 
@@ -171,18 +184,34 @@ class NifTextureSearchTab(QWidget):
         details_layout = QVBoxLayout(details_group)
         details_layout.setContentsMargins(4, 2, 4, 2)
         details_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self._details_filter_input, detail_expand, detail_collapse = self._filter_controls(
+            details_layout, "Filter referenced textures and providers..."
+        )
 
         self._details_tree = QTreeWidget()
         self._details_tree.setHeaderLabels(["Property", "Value"])
         self._details_tree.setAlternatingRowColors(True)
-        self._details_tree.setRootIsDecorated(False)
+        self._details_tree.setRootIsDecorated(True)
+        self._details_tree.setUniformRowHeights(True)
 
         header2 = self._details_tree.header()
-        header2.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        header2.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
         header2.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self._details_tree.setColumnWidth(0, 100)
+        self._details_tree.setColumnWidth(0, 175)
 
         details_layout.addWidget(self._details_tree)
+        self._details_label = QLabel("")
+        details_layout.addWidget(self._details_label)
+        self._results_filter = AssetTreeFilter(
+            self._results_tree, self._results_filter_input, self._results_label, "nif"
+        )
+        self._details_filter = AssetTreeFilter(
+            self._details_tree, self._details_filter_input, self._details_label, "texture"
+        )
+        result_expand.clicked.connect(self._results_filter.expand_all)
+        result_collapse.clicked.connect(self._results_filter.collapse_all)
+        detail_expand.clicked.connect(self._details_filter.expand_all)
+        detail_collapse.clicked.connect(self._details_filter.collapse_all)
 
         splitter.addWidget(details_group)
         splitter.setSizes([450, 350])
@@ -224,6 +253,19 @@ class NifTextureSearchTab(QWidget):
 
         layout.addLayout(bottom_row)
 
+    def _filter_controls(self, layout, placeholder):
+        row = QHBoxLayout()
+        edit = QLineEdit()
+        edit.setPlaceholderText(placeholder)
+        edit.setClearButtonEnabled(True)
+        row.addWidget(edit, 1)
+        expand = QPushButton("Expand All")
+        collapse = QPushButton("Collapse All")
+        row.addWidget(expand)
+        row.addWidget(collapse)
+        layout.addLayout(row)
+        return edit, expand, collapse
+
     def _set_rows_height(self, view: QTreeWidget, rows: int) -> None:
         row_height = view.sizeHintForRow(0)
         if row_height <= 0:
@@ -243,7 +285,10 @@ class NifTextureSearchTab(QWidget):
 
         self._results_tree.itemClicked.connect(self._on_result_clicked)
         self._results_tree.itemDoubleClicked.connect(self._on_result_double_clicked)
-        self._details_tree.itemDoubleClicked.connect(self._copy_detail_item)
+        self._details_tree.itemClicked.connect(self._on_detail_clicked)
+        self._details_tree.itemDoubleClicked.connect(self._on_detail_double_clicked)
+        self._results_tree.itemSelectionChanged.connect(self._on_selection_changed)
+        self._details_tree.itemSelectionChanged.connect(self._on_selection_changed)
 
         self._copy_btn.clicked.connect(self._copy_results)
         self._goto_btn.clicked.connect(self._goto_selected_mod)
@@ -253,6 +298,69 @@ class NifTextureSearchTab(QWidget):
         self._nif_to_dds_radio.toggled.connect(self._on_mode_changed)
         self._include_bsas_cb.toggled.connect(self._on_include_bsas_toggled)
         self._active_only_cb.toggled.connect(self._on_active_only_toggled)
+
+    def _subscribe_profile_changes(self):
+        self._profile_refresh_timer = QTimer(self)
+        self._profile_refresh_timer.setSingleShot(True)
+        self._profile_refresh_timer.setInterval(350)
+        self._profile_refresh_timer.timeout.connect(self._refresh_profile_search)
+        try:
+            self._mod_list.onModStateChanged(self._on_states_changed)
+            self._mod_list.onModMoved(self._on_priority_changed)
+            plugins = self._organizer.pluginList()
+            plugins.onPluginStateChanged(self._on_states_changed)
+            plugins.onPluginMoved(self._on_priority_changed)
+            plugins.onRefreshed(self._on_profile_dirty)
+            self._organizer.onProfileChanged(self._on_profile_changed)
+        except AttributeError:
+            pass
+
+    def _on_states_changed(self, changes: dict):
+        if not self._include_bsas_cb.isChecked() and self._active_only_cb.isChecked():
+            self._profile_index_dirty = True
+        self._on_profile_dirty()
+
+    def _on_priority_changed(self, name, old_priority, new_priority):
+        self._on_profile_dirty()
+
+    def _on_profile_changed(self, old_profile, new_profile):
+        self._profile_index_dirty = True
+        self._on_profile_dirty()
+
+    def _on_profile_dirty(self):
+        self._invalidate_search()
+        self._clear_search_views()
+        self._profile_refresh_timer.start()
+
+    def _refresh_profile_search(self):
+        if self._profile_index_dirty and not self._first_activation:
+            self._profile_index_dirty = False
+            if self._is_indexing:
+                self._pending_scope_rebuild = True
+                self._stop_indexing()
+            else:
+                self._start_indexing(force_rebuild=False)
+            return
+        if self._last_query and self._index.is_loaded and not self._is_indexing:
+            self._do_search()
+
+    def _invalidate_search(self):
+        self._search_generation += 1
+        for worker in self._search_workers:
+            worker.cancel()
+        self._snapshot = None
+        self._action_data = None
+        if not self._is_indexing:
+            self._stop_btn.setEnabled(False)
+
+    def _clear_search_views(self):
+        self._results_filter.reset()
+        self._details_filter.reset()
+        self._results_tree.clear()
+        self._details_tree.clear()
+        self._results_label.setText("No results")
+        self._details_label.clear()
+        self._set_action_data(None)
 
     def _apply_scope_controls(self) -> None:
         exhaustive = self._include_bsas_cb.isChecked()
@@ -264,11 +372,13 @@ class NifTextureSearchTab(QWidget):
         )
 
     def _on_include_bsas_toggled(self, checked: bool) -> None:
+        self._invalidate_search()
+        self._clear_search_views()
         self.settings.setValue(f"{self.SETTINGS_KEY}/IncludeBSAs", checked)
         self.settings.sync()
         self._apply_scope_controls()
         self.include_bsas_changed.emit(checked)
-        self._index.clear()
+        self._index = NifTextureIndex(self._index.cache_dir)
         self._update_index_status()
         self._search_btn.setEnabled(False)
         if self._is_indexing:
@@ -280,7 +390,9 @@ class NifTextureSearchTab(QWidget):
     def _on_active_only_toggled(self, _checked: bool) -> None:
         if self._include_bsas_cb.isChecked():
             return
-        self._index.clear()
+        self._invalidate_search()
+        self._clear_search_views()
+        self._index = NifTextureIndex(self._index.cache_dir)
         self._update_index_status()
         self._search_btn.setEnabled(False)
         if self._is_indexing:
@@ -339,8 +451,10 @@ class NifTextureSearchTab(QWidget):
         if self._is_indexing:
             return
 
+        self._invalidate_search()
+        self._clear_search_views()
         if force_rebuild:
-            self._index.clear()
+            self._index = NifTextureIndex(self._index.cache_dir)
 
         self._is_indexing = True
         self._rebuild_btn.setEnabled(False)
@@ -367,11 +481,21 @@ class NifTextureSearchTab(QWidget):
         self._index_worker.progress.connect(self._on_index_progress)
         self._index_worker.phase.connect(self._on_index_phase)
         self._index_worker.index_ready.connect(self._on_index_ready)
-        self._index_worker.finished.connect(self._on_index_finished)
+        self._index_worker.completed.connect(self._on_index_finished)
         self._index_worker.error.connect(self._on_index_error)
         self._index_worker.warning.connect(self._on_index_warning)
+        worker = self._index_worker
+        self._index_workers.append(worker)
+        worker.finished.connect(lambda: self._release_index_worker(worker))
 
         self._index_worker.start()
+
+    def _release_index_worker(self, worker):
+        if worker in self._index_workers:
+            self._index_workers.remove(worker)
+        if self._index_worker is worker:
+            self._index_worker = None
+        worker.deleteLater()
 
     def _rebuild_index(self) -> None:
         self._start_indexing(force_rebuild=True)
@@ -381,6 +505,12 @@ class NifTextureSearchTab(QWidget):
             self._index_worker.cancel()
             self._stop_btn.setEnabled(False)
             self._progress_label.setText("Stopping...")
+        elif self._search_workers:
+            self._invalidate_search()
+            self._clear_search_views()
+            self._results_label.setText("Search stopped")
+            self._stop_btn.setEnabled(False)
+            self._search_btn.setEnabled(self._index.is_loaded)
 
     def _on_index_progress(self, current: int, total: int, filename: str) -> None:
         if total > 0:
@@ -420,6 +550,8 @@ class NifTextureSearchTab(QWidget):
             QTimer.singleShot(0, lambda: self._start_indexing(force_rebuild=True))
         elif self._pending_external_texture_query:
             QTimer.singleShot(0, self._run_pending_external_search)
+        elif self._last_query and self._index.is_loaded:
+            QTimer.singleShot(0, self._do_search)
 
     def _on_index_warning(self, message: str) -> None:
         self.status_changed.emit(f"Archive warning: {message}")
@@ -436,6 +568,9 @@ class NifTextureSearchTab(QWidget):
         self._index_status.setText(f"Error: {message}")
         self._pending_external_texture_query = ""
         self.status_changed.emit(f"Index error: {message}")
+        if self._pending_scope_rebuild:
+            self._pending_scope_rebuild = False
+            QTimer.singleShot(0, lambda: self._start_indexing(force_rebuild=True))
 
     def _update_index_status(self) -> None:
         if self._index.is_loaded:
@@ -449,6 +584,9 @@ class NifTextureSearchTab(QWidget):
             self._index_status.setText("Index not loaded")
 
     def _on_mode_changed(self, checked: bool) -> None:
+        self._invalidate_search()
+        self._clear_search_views()
+        self._search_btn.setEnabled(self._index.is_loaded and not self._is_indexing)
         if checked:
             self._search_input.setPlaceholderText(
                 "Enter NIF filename (e.g. armor01, weapons/sword)...",
@@ -460,126 +598,119 @@ class NifTextureSearchTab(QWidget):
 
     def _do_search(self) -> None:
         query = self._search_input.text().strip()
-        if not query:
+        if not query or self._is_indexing:
             return
-
         if not self._index.is_loaded:
-            QMessageBox.information(
-                self,
-                "Index Required",
-                "Please wait for indexing to complete or click 'Rebuild Index'.",
-            )
+            QMessageBox.information(self, "Index Required", "Please wait for indexing or rebuild the index.")
             return
+        self._invalidate_search()
+        self._clear_search_views()
+        self._results_filter.reset(clear=True)
+        self._details_filter.reset(clear=True)
+        self._last_query = query
+        generation = self._search_generation
+        self._search_btn.setEnabled(False)
+        self._stop_btn.setEnabled(True)
+        self._results_label.setText("Resolving current-profile winners...")
+        worker = NifSearchWorker(
+            self._organizer, self._index, query, self._nif_to_dds_radio.isChecked(), generation
+        )
+        self._search_workers.append(worker)
+        worker.ready.connect(self._on_search_ready)
+        worker.failed.connect(self._on_search_failed)
+        worker.finished.connect(lambda: self._release_search_worker(worker))
+        worker.start()
 
-        self._results_tree.clear()
-        self._details_tree.clear()
-        self._goto_btn.setEnabled(False)
-        self._preview_btn.setEnabled(False)
-        self._open_folder_btn.setEnabled(False)
+    def _release_search_worker(self, worker):
+        if worker in self._search_workers:
+            self._search_workers.remove(worker)
+        worker.deleteLater()
 
-        if self._nif_to_dds_radio.isChecked():
-            self._search_nif_textures(query)
+    def _on_search_failed(self, generation, message):
+        if generation != self._search_generation:
+            return
+        self._search_btn.setEnabled(self._index.is_loaded and not self._is_indexing)
+        self._stop_btn.setEnabled(False)
+        self._results_label.setText(f"Search failed: {message}")
+        self.status_changed.emit(f"Search error: {message}")
+
+    def _on_search_ready(self, generation, payload):
+        if generation != self._search_generation:
+            return
+        self._snapshot = payload["snapshot"]
+        results = payload["results"]
+        groups = {}
+        nif_to_dds = payload["nif_to_dds"]
+        if not nif_to_dds:
+            for label, minimum, maximum in (("Exact matches", 70, 101),
+                                             ("Partial matches", 40, 70),
+                                             ("Possible matches", 0, 40)):
+                count = sum(minimum <= score < maximum for entry, score in results)
+                if count:
+                    group = QTreeWidgetItem([f"{label} ({count})", "", ""])
+                    group.setData(0, Qt.ItemDataRole.UserRole, {"type": "group"})
+                    self._results_tree.addTopLevelItem(group)
+                    group.setExpanded(True)
+                    groups[label] = group
+            high = [item for item in results if item[1] >= 70]
+            medium = [item for item in results if 40 <= item[1] < 70]
+            low = [item for item in results if item[1] < 40]
+            self._show_dds_search_summary(payload["query"], results, high, medium, low, payload["total"])
         else:
-            self._search_texture_nifs(query)
+            self._add_detail("Query", payload["query"])
+            self._add_detail("Matching NIFs", str(payload["total"]))
+            self._add_detail("Details", "Select a NIF or referenced texture")
+        warnings = self._snapshot.warnings
+        if warnings:
+            self._add_detail("Resolution Warnings", f"{len(warnings)} (see tooltip)").setToolTip(
+                1, "\n".join(warnings)
+            )
+        suffix = ""
+        if payload["total"] > len(results):
+            suffix = f" - showing first {len(results)} of {payload['total']} matches"
+        self._results_filter.suffix = suffix
+        self._details_filter.apply()
 
-    def _search_nif_textures(self, query: str) -> None:
-        results = self._index.find_textures_by_nif(query)
-
-        if not results:
-            self._results_label.setText("No NIFs found")
-            return
-
-        total_textures = 0
-
-        for entry, score in results:
-            source_label = entry.mod_name
-            if entry.source_kind == "bsa":
-                source_label = f"{entry.mod_name} [{Path(entry.container_path).name}]"
-            nif_item = QTreeWidgetItem([
-                f"📄 {entry.filename}",
-                str(score),
-                source_label,
-            ])
-            nif_item.setData(0, Qt.ItemDataRole.UserRole, {
-                "type": "nif",
-                "entry": entry,
-            })
-            nif_item.setToolTip(0, self._entry_location(entry))
-
-            font = QFont()
-            font.setBold(True)
-            nif_item.setFont(0, font)
-
-            for tex in entry.textures:
-                total_textures += 1
-                tex_filename = tex.rsplit("/", 1)[-1] if "/" in tex else tex
-
-                tex_item = QTreeWidgetItem([f"🖼️ {tex_filename}", "", ""])
-                tex_item.setData(0, Qt.ItemDataRole.UserRole, {
-                    "type": "texture",
-                    "path": tex,
-                    "nif_entry": entry,
-                })
-                tex_item.setToolTip(0, tex)
-
-                nif_item.addChild(tex_item)
-
-            self._results_tree.addTopLevelItem(nif_item)
-
-        if self._results_tree.topLevelItemCount() > 0:
-            self._results_tree.expandItem(self._results_tree.topLevelItem(0))
-
-        self._results_label.setText(f"{len(results)} NIFs, {total_textures} textures")
-
-    def _search_texture_nifs(self, query: str) -> None:
-        results = self._index.find_nifs_by_texture(query)
-
-        if not results:
-            self._results_label.setText("No NIFs found using this texture")
-            self._show_dds_search_summary(query, [], [], [], [])
-            return
-
-        high = [(e, s) for e, s in results if s >= 70]
-        medium = [(e, s) for e, s in results if 40 <= s < 70]
-        low = [(e, s) for e, s in results if s < 40]
-
-        def add_group(name: str, items: list, icon: str):
-            if not items:
+        def append_batch(offset=0):
+            if generation != self._search_generation:
                 return
+            self._results_tree.setUpdatesEnabled(False)
+            try:
+                for entry, score in results[offset:offset + 40]:
+                    item = self._make_nif_item(entry, score, nif_to_dds)
+                    if nif_to_dds:
+                        self._results_tree.addTopLevelItem(item)
+                    else:
+                        name = "Exact matches" if score >= 70 else "Partial matches" if score >= 40 else "Possible matches"
+                        groups[name].addChild(item)
+            finally:
+                self._results_tree.setUpdatesEnabled(True)
+            if offset + 40 < len(results):
+                QTimer.singleShot(0, lambda: append_batch(offset + 40))
+            else:
+                if nif_to_dds and results:
+                    self._results_tree.topLevelItem(0).setExpanded(True)
+                self._results_filter.apply()
+                self._search_btn.setEnabled(True)
+                self._stop_btn.setEnabled(False)
+                self.status_changed.emit(
+                    f"{payload['total']} unique winning NIFs; {len(warnings)} resolution warnings"
+                )
+        append_batch()
 
-            group = QTreeWidgetItem([f"{icon} {name} ({len(items)})", "", ""])
-            group.setData(0, Qt.ItemDataRole.UserRole, {"type": "group"})
-
-            font = QFont()
-            font.setBold(True)
-            group.setFont(0, font)
-
-            for entry, score in items:
-                source_label = entry.mod_name
-                if entry.source_kind == "bsa":
-                    source_label = f"{entry.mod_name} [{Path(entry.container_path).name}]"
-                item = QTreeWidgetItem([
-                    entry.filename,
-                    str(score),
-                    source_label,
-                ])
-                item.setData(0, Qt.ItemDataRole.UserRole, {
-                    "type": "nif",
-                    "entry": entry,
-                })
-                item.setToolTip(0, self._entry_location(entry))
-
-                group.addChild(item)
-
-            self._results_tree.addTopLevelItem(group)
-            group.setExpanded(True)
-
-        add_group("Exact matches", high, "🎯")
-        add_group("Partial matches", medium, "🔍")
-        add_group("Possible matches", low, "❓")
-
-        self._results_label.setText(f"{len(results)} NIFs found")
-        self._show_dds_search_summary(query, results, high, medium, low)
+    def _make_nif_item(self, entry, score, include_textures):
+        label = self._provider_label(entry_source(entry))
+        item = QTreeWidgetItem([entry.filename, str(score), label])
+        item.setData(0, Qt.ItemDataRole.UserRole, {
+            "type": "nif", "entry": entry,
+            "search": f"{entry.filename} {entry.relative_path} {label}",
+        })
+        item.setToolTip(0, self._entry_location(entry))
+        item.setToolTip(2, label)
+        if include_textures:
+            for texture_path in entry.textures:
+                item.addChild(self._make_texture_item(texture_path, entry, results=True))
+        return item
 
     def _show_dds_search_summary(
         self,
@@ -588,10 +719,13 @@ class NifTextureSearchTab(QWidget):
         high: list,
         medium: list,
         low: list,
+        total=None,
     ) -> None:
         self._add_detail("--- DDS -> NIF Search ---", "")
         self._add_detail("Query", query)
-        self._add_detail("Matching NIFs", str(len(results)))
+        self._add_detail("Matching NIFs", str(total if total is not None else len(results)))
+        if total is not None and total > len(results):
+            self._add_detail("Displayed NIFs", str(len(results)))
         self._add_detail("Exact", str(len(high)))
         self._add_detail("Partial", str(len(medium)))
         self._add_detail("Possible", str(len(low)))
@@ -600,71 +734,85 @@ class NifTextureSearchTab(QWidget):
         else:
             self._add_detail("Details", "No indexed NIF references matched this query")
 
-    def _add_detail(self, key: str, value: str) -> None:
+    def _add_detail(self, key: str, value: str):
         item = QTreeWidgetItem([key, value])
         item.setToolTip(1, value)
+        item.setData(0, Qt.ItemDataRole.UserRole, {"type": "property"})
         self._details_tree.addTopLevelItem(item)
+        return item
 
     def _on_result_clicked(self, item: QTreeWidgetItem, column: int) -> None:
         data = item.data(0, Qt.ItemDataRole.UserRole)
         if not data:
             return
 
+        self._details_filter.reset()
         self._details_tree.clear()
         item_type = data.get("type")
 
         if item_type == "nif":
             self._show_nif_details(data["entry"])
-            self._goto_btn.setEnabled(not data["entry"].is_game)
-            self._preview_btn.setEnabled(True)
-            self._open_folder_btn.setEnabled(True)
         elif item_type == "texture":
             self._show_texture_details(data)
-            self._goto_btn.setEnabled(not data["nif_entry"].is_game)
-            self._preview_btn.setEnabled(can_preview_virtual_path(data.get("path", "")))
-            self._open_folder_btn.setEnabled(True)
-        else:
-            self._goto_btn.setEnabled(False)
-            self._preview_btn.setEnabled(False)
-            self._open_folder_btn.setEnabled(False)
+        self._details_filter.apply()
+        self._set_action_data(data)
 
     def _show_nif_details(self, entry: NifTextureEntry) -> None:
-        self._add_detail("--- NIF Info ---", "")
         self._add_detail("File", entry.filename)
         self._add_detail("Path", entry.relative_path)
         self._add_detail("Mod", entry.mod_name)
-        self._add_detail("Source", "BSA" if entry.source_kind == "bsa" else "Loose file")
-        if entry.source_kind == "bsa":
-            self._add_detail("Archive", entry.container_path)
+        self._add_detail("Source Type", "BSA" if entry.source_kind == "bsa" else "Loose file").setToolTip(
+            1, self._entry_location(entry)
+        )
         self._add_detail("Texture Count", str(len(entry.textures)))
+        if entry.parse_error:
+            self._add_detail("Read Error", entry.parse_error)
+        group = QTreeWidgetItem(["Referenced Textures", str(len(entry.textures))])
+        group.setData(0, Qt.ItemDataRole.UserRole, {"type": "group"})
+        self._details_tree.addTopLevelItem(group)
+        for texture_path in entry.textures:
+            group.addChild(self._make_texture_item(texture_path, entry))
+        group.setExpanded(True)
 
-        preview = "; ".join(entry.textures[:3])
-        if len(entry.textures) > 3:
-            preview += f"; ... (+{len(entry.textures) - 3} more)"
-        self._add_detail("Textures", preview or "None")
-
-        self._add_detail("--- Texture Paths ---", "")
-        for texture_path in entry.textures[:20]:
-            providers = self._index.find_texture_providers(texture_path)
-            if providers:
-                self._add_detail(
-                    "Found",
-                    f"{texture_path} -> {self._format_provider_preview(providers)}",
-                )
-            else:
-                self._add_detail("Missing", texture_path)
-        if len(entry.textures) > 20:
-            self._add_detail("...", f"+{len(entry.textures) - 20} more")
+    def _make_texture_item(self, texture_path, entry, results=False):
+        providers = self._snapshot.providers(texture_path) if self._snapshot else []
+        found = any(provider.winning for provider in providers)
+        status = "Found" if found else "Missing"
+        item = QTreeWidgetItem(
+            [texture_path, status, ""] if results else [status, texture_path]
+        )
+        item.setData(0, Qt.ItemDataRole.UserRole, {
+            "type": "texture", "path": texture_path, "nif_entry": entry,
+            "search": f"{texture_path} {status}",
+        })
+        item.setToolTip(0, texture_path)
+        item.setToolTip(1, texture_path)
+        if not results:
+            for provider in providers:
+                source = provider.source
+                child = QTreeWidgetItem(["Provider", provider.label])
+                child.setToolTip(1, source.location_text)
+                child.setData(0, Qt.ItemDataRole.UserRole, {
+                    "type": "provider", "source": source, "path": texture_path,
+                    "nif_entry": entry, "search": f"{texture_path} {provider.label}",
+                })
+                item.addChild(child)
+        return item
 
     def _show_texture_details(self, data: dict) -> None:
-        self._add_detail("--- Texture Info ---", "")
         self._add_detail("Path", data.get("path", ""))
         entry = data.get("nif_entry")
         if entry:
             self._add_detail("NIF", entry.relative_path)
             self._add_detail("Mod", entry.mod_name)
-            self._add_detail("Source", "BSA" if entry.source_kind == "bsa" else "Loose file")
-        self._show_texture_providers(data.get("path", ""))
+            self._add_detail("Source Type", "BSA" if entry.source_kind == "bsa" else "Loose file")
+        group = QTreeWidgetItem(["Referenced Textures", "1"])
+        group.setData(0, Qt.ItemDataRole.UserRole, {"type": "group"})
+        self._details_tree.addTopLevelItem(group)
+        texture = self._make_texture_item(data.get("path", ""), entry)
+        group.addChild(texture)
+        group.setExpanded(True)
+        texture.setExpanded(True)
 
     @staticmethod
     def _provider_label(source: AssetSource) -> str:
@@ -673,25 +821,42 @@ class NifTextureSearchTab(QWidget):
             return f"{source.owner} [{archive}]"
         return f"{source.owner} [Loose]"
 
-    def _format_provider_preview(self, providers: list[AssetSource]) -> str:
-        labels = [self._provider_label(source) for source in providers[:2]]
-        if len(providers) > 2:
-            labels.append(f"+{len(providers) - 2} more")
-        return "; ".join(labels)
+    def _on_detail_clicked(self, item, column):
+        data = item.data(0, Qt.ItemDataRole.UserRole) or {}
+        self._set_action_data(data if data.get("type") in ("texture", "provider") else None)
 
-    def _show_texture_providers(self, texture_path: str) -> None:
-        self._add_detail("--- Providers ---", "")
-        providers = self._index.find_texture_providers(texture_path)
-        if not providers:
-            self._add_detail("Status", "Not found in indexed sources")
-            return
+    def _on_detail_double_clicked(self, item, column):
+        data = item.data(0, Qt.ItemDataRole.UserRole) or {}
+        if data.get("type") in ("texture", "provider"):
+            self._preview_result_data(data)
+        else:
+            self._copy_detail_item(item, column)
 
-        self._add_detail("Status", f"Found ({len(providers)} providers)")
-        for number, provider in enumerate(providers, start=1):
-            self._add_detail(
-                f"Provider {number}",
-                f"{self._provider_label(provider)}: {provider.location_text}",
-            )
+    def _on_selection_changed(self):
+        if self._action_data and not any(
+            item.data(0, Qt.ItemDataRole.UserRole) == self._action_data
+            for item in self._results_tree.selectedItems() + self._details_tree.selectedItems()
+        ):
+            self._set_action_data(None)
+
+    def _set_action_data(self, data):
+        self._action_data = data
+        source = self._action_source(data)
+        self._goto_btn.setEnabled(bool(source and not source.is_game))
+        self._open_folder_btn.setEnabled(bool(source))
+        self._preview_btn.setEnabled(bool(source and can_preview_virtual_path(source.virtual_path)))
+
+    def _action_source(self, data):
+        if not data:
+            return None
+        if data.get("type") == "provider":
+            return data["source"]
+        if data.get("type") == "nif":
+            return entry_source(data["entry"])
+        if data.get("type") == "texture" and self._snapshot:
+            return next((provider.source for provider in self._snapshot.providers(data["path"])
+                         if provider.winning), None)
+        return None
 
     @staticmethod
     def _entry_location(entry: NifTextureEntry) -> str:
@@ -754,81 +919,49 @@ class NifTextureSearchTab(QWidget):
             self.status_changed.emit(f"Could not find mod: {display_name}")
 
     def _preview_selected_result(self) -> None:
-        items = self._results_tree.selectedItems()
-        if not items:
-            return
-
-        data = items[0].data(0, Qt.ItemDataRole.UserRole)
-        if not data:
-            return
-
-        self._preview_result_data(data)
+        if self._action_data:
+            self._preview_result_data(self._action_data)
 
     def _preview_result_data(self, data: dict) -> None:
-        item_type = data.get("type")
-        if item_type == "nif":
+        if data.get("type") not in ("nif", "texture", "provider"):
+            return
+        if data.get("type") == "nif":
             entry = data.get("entry")
             if preview_nif_entry(self, entry, self._organizer) and entry:
                 self.status_changed.emit(f"Preview: {entry.relative_path}")
             return
-
-        if item_type == "texture":
-            texture_path = data.get("path", "")
-            providers = self._index.find_texture_providers(texture_path)
-            if not providers:
-                QMessageBox.information(self, "Preview", "No indexed DDS provider was found for this texture.")
-                return
-            if preview_asset_source(self, providers[0], self._organizer):
-                self.status_changed.emit(f"Preview: {texture_path}")
+        source = self._action_source(data)
+        if source is None:
+            QMessageBox.information(self, "Preview", "No effective DDS provider exists in the current profile.")
+        elif preview_asset_source(self, source, self._organizer, exact_source=True):
+            self.status_changed.emit(f"Preview: {source.virtual_path}")
 
     def _open_selected_folder(self) -> None:
-        items = self._results_tree.selectedItems()
-        if not items:
+        source = self._action_source(self._action_data)
+        if source is None:
             return
-
-        data = items[0].data(0, Qt.ItemDataRole.UserRole)
-        if not data:
-            return
-
-        entry = None
-        if data.get("type") == "nif":
-            entry = data["entry"]
-        elif data.get("type") == "texture":
-            entry = data.get("nif_entry")
-
-        if not entry:
-            return
-
-        file_path = entry.container_path
-        if not file_path:
-            if entry.is_game:
-                return
-            mod_info = self._mod_list.getMod(entry.mod_name)
-            if not mod_info:
-                return
-            file_path = os.path.join(mod_info.absolutePath(), entry.relative_path)
+        file_path = source.navigation_path or source.container_path
         folder_path = os.path.dirname(file_path)
-
         if os.path.exists(folder_path):
             import subprocess
             import sys
-
             if sys.platform == "win32":
                 if os.path.exists(file_path):
-                    subprocess.run(["explorer", "/select,", file_path])
+                    subprocess.Popen(["explorer", "/select,", file_path])
                 else:
                     os.startfile(folder_path)
             elif sys.platform == "darwin":
                 subprocess.Popen(["open", folder_path])
             else:
                 subprocess.Popen(["xdg-open", folder_path])
-
             self.status_changed.emit(f"Opened: {folder_path}")
 
     def _copy_results(self) -> None:
         lines = ["=== NIF ↔ DDS Search Results ===", ""]
 
         def collect_items(item: QTreeWidgetItem, indent: int = 0):
+            if item.isHidden():
+                return
             prefix = "  " * indent
             text = item.text(0)
             score = item.text(1)
@@ -851,22 +984,9 @@ class NifTextureSearchTab(QWidget):
         self.status_changed.emit("Results copied to clipboard")
 
     def _goto_selected_mod(self) -> None:
-        items = self._results_tree.selectedItems()
-        if not items:
-            return
-
-        data = items[0].data(0, Qt.ItemDataRole.UserRole)
-        if not data:
-            return
-
-        entry = None
-        if data.get("type") == "nif":
-            entry = data["entry"]
-        elif data.get("type") == "texture":
-            entry = data.get("nif_entry")
-
-        if entry and not entry.is_game:
-            self._goto_mod_in_view(entry.mod_name)
+        source = self._action_source(self._action_data)
+        if source and not source.is_game:
+            self._goto_mod_in_view(source.owner)
 
     def focus_search(self) -> None:
         self._search_input.setFocus()
