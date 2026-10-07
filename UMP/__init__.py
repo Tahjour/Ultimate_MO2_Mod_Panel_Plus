@@ -41,19 +41,6 @@ try:
 except Exception as e:
     _autoscroller_import_error = e
 
-_copy_past_module = None
-_copy_past_import_error: Optional[Exception] = None
-try:
-    _copy_past_path = os.path.join(os.path.dirname(__file__), "COPY-Past.py")
-    if os.path.exists(_copy_past_path):
-        _spec = importlib.util.spec_from_file_location("advancedsearch_copy_past", _copy_past_path)
-        if _spec and _spec.loader:
-            _copy_past_module = importlib.util.module_from_spec(_spec)
-            _spec.loader.exec_module(_copy_past_module)  # type: ignore[attr-defined]
-except Exception as e:
-    _copy_past_import_error = e
-
-
 _mod_renamer_module = None
 _mod_renamer_import_error: Optional[Exception] = None
 try:
@@ -175,14 +162,6 @@ def createPlugins():
             autoscroller_plugin = _autoscroller_module.createPlugin()
             if autoscroller_plugin is not None:
                 plugins.append(autoscroller_plugin)
-    except Exception:
-        pass
-
-    try:
-        if _copy_past_module is not None and hasattr(_copy_past_module, "createPlugin"):
-            copy_past_plugin = _copy_past_module.createPlugin()
-            if copy_past_plugin is not None:
-                plugins.append(copy_past_plugin)
     except Exception:
         pass
 
